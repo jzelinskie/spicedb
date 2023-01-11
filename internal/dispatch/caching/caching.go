@@ -397,8 +397,9 @@ func (cd *Dispatcher) DispatchReachableResources(req *v1.DispatchReachableResour
 	return nil
 }
 
+// sliceSize is an approximatation of the runtime size of a slice.
+// It is the sum of the size of a slice's header and its backing array.
 func sliceSize(xs []byte) int64 {
-	// Slice Header + Slice Contents
 	return int64(int(unsafe.Sizeof(xs)) + len(xs))
 }
 

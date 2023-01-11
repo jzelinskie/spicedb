@@ -2,6 +2,7 @@ package keys
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 // DispatchCacheKey is a struct which holds the key representing a dispatch operation being
@@ -23,6 +24,10 @@ func (dck DispatchCacheKey) StableSumAsBytes() []byte {
 // unlikely.
 func (dck DispatchCacheKey) AsUInt64s() (uint64, uint64) {
 	return dck.processSpecificSum, dck.stableSum
+}
+
+func (dck DispatchCacheKey) String() string {
+	return fmt.Sprintf("%x%x", dck.processSpecificSum, dck.stableSum)
 }
 
 var emptyDispatchCacheKey = DispatchCacheKey{0, 0}

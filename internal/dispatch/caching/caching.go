@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/exp/maps"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/dustin/go-humanize"
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,6 +31,7 @@ const (
 type Dispatcher struct {
 	d          dispatch.Dispatcher
 	c          cache.Cache
+	g          singleflight.Group
 	keyHandler keys.Handler
 
 	checkTotalCounter                  prometheus.Counter
@@ -229,16 +231,14 @@ func (cd *Dispatcher) DispatchCheck(ctx context.Context, req *v1.DispatchCheckRe
 		return &v1.DispatchCheckResponse{Metadata: &v1.ResponseMeta{}}, err
 	}
 
-	// Disable caching when debugging is enabled.
-	if cachedResultRaw, found := cd.c.Get(requestKey); found {
+	if cacheEntry, found := cd.c.Get(requestKey); found {
 		var response v1.DispatchCheckResponse
-		if err := response.UnmarshalVT(cachedResultRaw.([]byte)); err != nil {
+		if err := response.UnmarshalVT(cacheEntry.([]byte)); err != nil {
 			return &v1.DispatchCheckResponse{Metadata: &v1.ResponseMeta{}}, err
 		}
 
 		if req.Metadata.DepthRemaining >= response.Metadata.DepthRequired {
 			cd.checkFromCacheCounter.Inc()
-			// If debugging is requested, add the req and the response to the trace.
 			if req.Debug == v1.DispatchCheckRequest_ENABLE_BASIC_DEBUGGING {
 				response.Metadata.DebugInfo = &v1.DebugInformation{
 					Check: &v1.CheckDebugTrace{
@@ -248,36 +248,46 @@ func (cd *Dispatcher) DispatchCheck(ctx context.Context, req *v1.DispatchCheckRe
 					},
 				}
 			}
-
 			return &response, nil
 		}
 	}
-	computed, err := cd.d.DispatchCheck(ctx, req)
 
-	// We only want to cache the result if there was no error
-	if err == nil {
-		adjustedComputed := computed.CloneVT()
-		adjustedComputed.Metadata.CachedDispatchCount = adjustedComputed.Metadata.DispatchCount
-		adjustedComputed.Metadata.DispatchCount = 0
-		adjustedComputed.Metadata.DebugInfo = nil
+	dedupedResp, err, _ := cd.g.Do(requestKey.String(), func() (any, error) {
+		dispatchedResp, err := cd.d.DispatchCheck(ctx, req)
+		if err != nil {
+			return dispatchedResp, err
+		}
 
-		adjustedBytes, err := adjustedComputed.MarshalVT()
+		cacheClone := dispatchedResp.CloneVT()
+		cacheClone.Metadata.CachedDispatchCount = cacheClone.Metadata.DispatchCount
+		cacheClone.Metadata.DispatchCount = 0
+		cacheClone.Metadata.DebugInfo = nil
+
+		cacheEntry, err := cacheClone.MarshalVT()
 		if err != nil {
 			return &v1.DispatchCheckResponse{Metadata: &v1.ResponseMeta{}}, err
 		}
+		cd.c.Set(requestKey, cacheEntry, sliceSize(cacheEntry))
 
-		cd.c.Set(requestKey, adjustedBytes, sliceSize(adjustedBytes))
-	}
+		return dispatchedResp, nil
+	})
 
-	// Return both the computed and err in ALL cases: computed contains resolved
-	// metadata even if there was an error.
-	return computed, err
+	return dedupedResp.(*v1.DispatchCheckResponse), err
 }
 
-// DispatchExpand implements dispatch.Expand interface and does not do any caching yet.
+// DispatchExpand implements dispatch.Expand interface and does not do any
+// caching yet.
 func (cd *Dispatcher) DispatchExpand(ctx context.Context, req *v1.DispatchExpandRequest) (*v1.DispatchExpandResponse, error) {
-	resp, err := cd.d.DispatchExpand(ctx, req)
-	return resp, err
+	requestKey, err := cd.keyHandler.ExpandCacheKey(ctx, req)
+	if err != nil {
+		return &v1.DispatchExpandResponse{Metadata: &v1.ResponseMeta{}}, err
+	}
+	log.Warn().Str("requestKeyBytes", string(requestKey.StableSumAsBytes())).Send()
+
+	dedupedResp, err, _ := cd.g.Do(requestKey.String(), func() (any, error) {
+		return cd.d.DispatchExpand(ctx, req)
+	})
+	return dedupedResp.(*v1.DispatchExpandResponse), err
 }
 
 // DispatchLookup implements dispatch.Lookup interface and does not do any caching yet.
@@ -289,40 +299,39 @@ func (cd *Dispatcher) DispatchLookup(ctx context.Context, req *v1.DispatchLookup
 		return &v1.DispatchLookupResponse{Metadata: &v1.ResponseMeta{}}, err
 	}
 
-	if cachedResultRaw, found := cd.c.Get(requestKey); found {
+	if cacheEntry, found := cd.c.Get(requestKey); found {
 		var response v1.DispatchLookupResponse
-		if err := response.UnmarshalVT(cachedResultRaw.([]byte)); err != nil {
+		if err := response.UnmarshalVT(cacheEntry.([]byte)); err != nil {
 			return &v1.DispatchLookupResponse{Metadata: &v1.ResponseMeta{}}, err
 		}
-
 		if req.Metadata.DepthRemaining >= response.Metadata.DepthRequired {
 			log.Trace().Object("cachedLookup", req).Int("resultCount", len(response.ResolvedResources)).Send()
 			cd.lookupFromCacheCounter.Inc()
 			return &response, nil
 		}
 	}
-	computed, err := cd.d.DispatchLookup(ctx, req)
 
-	// We only want to cache the result if there was no error.
-	if err == nil {
-		log.Trace().Object("cachingLookup", req).Int("resultCount", len(computed.ResolvedResources)).Send()
+	dedupedResp, err, _ := cd.g.Do(requestKey.String(), func() (any, error) {
+		dispatchedResp, err := cd.d.DispatchLookup(ctx, req)
+		if err != nil {
+			return dispatchedResp, err
+		}
 
-		adjustedComputed := computed.CloneVT()
-		adjustedComputed.Metadata.CachedDispatchCount = adjustedComputed.Metadata.DispatchCount
-		adjustedComputed.Metadata.DispatchCount = 0
-		adjustedComputed.Metadata.DebugInfo = nil
+		log.Trace().Object("cachingLookup", req).Int("resultCount", len(dispatchedResp.ResolvedResources)).Send()
+		cacheClone := dispatchedResp.CloneVT()
+		cacheClone.Metadata.CachedDispatchCount = cacheClone.Metadata.DispatchCount
+		cacheClone.Metadata.DispatchCount = 0
+		cacheClone.Metadata.DebugInfo = nil
 
-		adjustedBytes, err := adjustedComputed.MarshalVT()
+		cacheEntry, err := cacheClone.MarshalVT()
 		if err != nil {
 			return &v1.DispatchLookupResponse{Metadata: &v1.ResponseMeta{}}, err
 		}
+		cd.c.Set(requestKey, cacheEntry, sliceSize(cacheEntry))
 
-		cd.c.Set(requestKey, adjustedBytes, sliceSize(adjustedBytes))
-	}
-
-	// Return both the computed and err in ALL cases: computed contains resolved
-	// metadata even if there was an error.
-	return computed, err
+		return dispatchedResp, nil
+	})
+	return dedupedResp.(*v1.DispatchLookupResponse), err
 }
 
 // DispatchReachableResources implements dispatch.ReachableResources interface.

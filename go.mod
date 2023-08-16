@@ -1,6 +1,6 @@
 module github.com/authzed/spicedb
 
-go 1.20
+go 1.21.0
 
 require (
 	buf.build/gen/go/prometheus/prometheus/protocolbuffers/go v1.31.0-20230726221845-41588ce133c8.1
@@ -44,6 +44,7 @@ require (
 	github.com/jackc/pgx/v5 v5.4.2
 	github.com/johannesboyne/gofakes3 v0.0.0-20230506070712-04da935ef877
 	github.com/jzelinskie/cobrautil/v2 v2.0.0-20230825161137-b46695920a60
+	github.com/jzelinskie/persistent v0.0.0-20230816160542-1205ef8f0e15
 	github.com/jzelinskie/stringz v0.0.2
 	github.com/lthibault/jitterbug v2.0.0+incompatible
 	github.com/magefile/mage v1.15.0
@@ -273,6 +274,8 @@ require (
 	github.com/sivchari/tenv v1.7.1 // indirect
 	github.com/sonatard/noctx v0.0.2 // indirect
 	github.com/sourcegraph/go-diff v0.7.0 // indirect
+	github.com/sourcegraph/go-lsp v0.0.0-20200429204803-219e11d77f5d
+	github.com/sourcegraph/jsonrpc2 v0.2.0
 	github.com/spf13/afero v1.9.5 // indirect
 	github.com/spf13/cast v1.5.1 // indirect
 	github.com/spf13/jwalterweatherman v1.1.0 // indirect

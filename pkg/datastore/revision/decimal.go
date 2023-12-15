@@ -1,6 +1,8 @@
 package revision
 
 import (
+	"math/big"
+
 	"github.com/shopspring/decimal"
 
 	"github.com/authzed/spicedb/pkg/datastore"
@@ -14,6 +16,10 @@ var NoRevision Decimal
 
 func NewFromDecimal(d decimal.Decimal) Decimal {
 	return Decimal{d}
+}
+
+func NewFromUint64(i uint64) Decimal {
+	return NewFromDecimal(decimal.NewFromBigInt(new(big.Int).SetUint64(i), 0))
 }
 
 func (d Decimal) Equal(rhs datastore.Revision) bool {

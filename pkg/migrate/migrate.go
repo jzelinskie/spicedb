@@ -71,6 +71,13 @@ func NewManager[D Driver[C, T], C any, T any]() *Manager[D, C, T] {
 	return &Manager[D, C, T]{migrations: make(map[string]migration[C, T])}
 }
 
+// MustRegister performs a call to Register() unconditionally.
+func (m *Manager[D, C, T]) MustRegister(version, replaces string, up MigrationFunc[C], upTx TxMigrationFunc[T]) {
+	if err := m.Register(version, replaces, up, upTx); err != nil {
+		panic("failed to register migration: " + err.Error())
+	}
+}
+
 // Register is used to associate a single migration with the migration engine.
 // The up parameter should be a function that performs the actual upgrade logic
 // and which takes a pointer to a concrete implementation of the Driver

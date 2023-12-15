@@ -18,6 +18,7 @@ import (
 	"github.com/authzed/spicedb/internal/datastore/mysql"
 	"github.com/authzed/spicedb/internal/datastore/postgres"
 	"github.com/authzed/spicedb/internal/datastore/spanner"
+	"github.com/authzed/spicedb/internal/datastore/sqlite"
 	"github.com/authzed/spicedb/internal/testfixtures"
 	testdatastore "github.com/authzed/spicedb/internal/testserver/datastore"
 	"github.com/authzed/spicedb/internal/testserver/datastore/config"
@@ -48,6 +49,7 @@ var drivers = []struct {
 	{crdb.Engine, "-overlap-static", []dsconfig.ConfigOption{dsconfig.WithOverlapStrategy("static")}},
 	{crdb.Engine, "-overlap-insecure", []dsconfig.ConfigOption{dsconfig.WithOverlapStrategy("insecure")}},
 	{mysql.Engine, "", nil},
+	{sqlite.Engine, "", nil},
 }
 
 var skipped = []string{

@@ -110,6 +110,11 @@ func (Testcons) Postgres() error {
 	return consistencyTest("postgres")
 }
 
+// SQLite Run consistency tests for postgres
+func (Testcons) Sqlite() error {
+	return consistencyTest("sqlite")
+}
+
 // Pgbouncer Run consistency tests for postgres with pgbouncer
 // FIXME actually implement this
 func (Testcons) Pgbouncer() error {

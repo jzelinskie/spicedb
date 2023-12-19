@@ -16,6 +16,7 @@ import (
 	"github.com/authzed/spicedb/internal/datastore/postgres"
 	"github.com/authzed/spicedb/internal/datastore/proxy"
 	"github.com/authzed/spicedb/internal/datastore/spanner"
+	"github.com/authzed/spicedb/internal/datastore/sqlite"
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/datastore"
 	"github.com/authzed/spicedb/pkg/validationfile"
@@ -29,6 +30,7 @@ const (
 	CockroachEngine = "cockroachdb"
 	SpannerEngine   = "spanner"
 	MySQLEngine     = "mysql"
+	SQLiteEngine    = "sqlite"
 )
 
 var BuilderForEngine = map[string]engineBuilderFunc{
@@ -37,6 +39,7 @@ var BuilderForEngine = map[string]engineBuilderFunc{
 	MemoryEngine:    newMemoryDatstore,
 	SpannerEngine:   newSpannerDatastore,
 	MySQLEngine:     newMySQLDatastore,
+	SQLiteEngine:    newSQLiteDatastore,
 }
 
 //go:generate go run github.com/ecordell/optgen -output zz_generated.connpool.options.go . ConnPoolConfig
@@ -362,8 +365,7 @@ func NewDatastore(ctx context.Context, options ...ConfigOption) (datastore.Datas
 }
 
 func newCRDBDatastore(opts Config) (datastore.Datastore, error) {
-	return crdb.NewCRDBDatastore(
-		opts.URI,
+	return crdb.NewCRDBDatastore(opts.URI,
 		crdb.GCWindow(opts.GCWindow),
 		crdb.RevisionQuantization(opts.RevisionQuantization),
 		crdb.MaxRevisionStalenessPercent(opts.MaxRevisionStalenessPercent),
@@ -392,7 +394,7 @@ func newCRDBDatastore(opts Config) (datastore.Datastore, error) {
 }
 
 func newPostgresDatastore(opts Config) (datastore.Datastore, error) {
-	pgOpts := []postgres.Option{
+	return postgres.NewPostgresDatastore(opts.URI,
 		postgres.GCWindow(opts.GCWindow),
 		postgres.GCEnabled(!opts.ReadOnly),
 		postgres.RevisionQuantization(opts.RevisionQuantization),
@@ -416,13 +418,11 @@ func newPostgresDatastore(opts Config) (datastore.Datastore, error) {
 		postgres.WithEnablePrometheusStats(opts.EnableDatastoreMetrics),
 		postgres.MaxRetries(uint8(opts.MaxRetries)),
 		postgres.MigrationPhase(opts.MigrationPhase),
-	}
-	return postgres.NewPostgresDatastore(opts.URI, pgOpts...)
+	)
 }
 
 func newSpannerDatastore(opts Config) (datastore.Datastore, error) {
-	return spanner.NewSpannerDatastore(
-		opts.URI,
+	return spanner.NewSpannerDatastore(opts.URI,
 		spanner.FollowerReadDelay(opts.FollowerReadDelay),
 		spanner.RevisionQuantization(opts.RevisionQuantization),
 		spanner.MaxRevisionStalenessPercent(opts.MaxRevisionStalenessPercent),
@@ -439,7 +439,7 @@ func newSpannerDatastore(opts Config) (datastore.Datastore, error) {
 }
 
 func newMySQLDatastore(opts Config) (datastore.Datastore, error) {
-	mysqlOpts := []mysql.Option{
+	return mysql.NewMySQLDatastore(opts.URI,
 		mysql.GCInterval(opts.GCInterval),
 		mysql.GCWindow(opts.GCWindow),
 		mysql.GCInterval(opts.GCInterval),
@@ -455,8 +455,15 @@ func newMySQLDatastore(opts Config) (datastore.Datastore, error) {
 		mysql.WithEnablePrometheusStats(opts.EnableDatastoreMetrics),
 		mysql.MaxRetries(uint8(opts.MaxRetries)),
 		mysql.OverrideLockWaitTimeout(1),
-	}
-	return mysql.NewMySQLDatastore(opts.URI, mysqlOpts...)
+	)
+}
+
+func newSQLiteDatastore(opts Config) (datastore.Datastore, error) {
+	return sqlite.NewDatastore(opts.URI,
+		sqlite.GCWindow(opts.GCWindow),
+		sqlite.RevisionQuantization(opts.RevisionQuantization),
+		sqlite.MaxRevisionStalenessPercent(opts.MaxRevisionStalenessPercent),
+	)
 }
 
 func newMemoryDatstore(opts Config) (datastore.Datastore, error) {

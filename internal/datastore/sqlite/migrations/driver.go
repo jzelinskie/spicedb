@@ -2,8 +2,8 @@ package migrations
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"strings"
 
 	"crawshaw.io/sqlite"
 	"crawshaw.io/sqlite/sqlitex"
@@ -58,14 +58,15 @@ func (d *AlembicSQLiteDriver) RunTx(ctx context.Context, f migrate.TxMigrationFu
 // Version returns the version of the schema to which the connected database
 // has been migrated.
 func (d *AlembicSQLiteDriver) Version(ctx context.Context) (string, error) {
-	stmt := d.db.Prep("SELECT version_num FROM alembic_version")
-	if hasRow, err := stmt.Step(); err != nil {
+	stmt, err := d.db.Prepare("SELECT version_num FROM alembic_version")
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			fmt.Println(err.Error())
+			return "", nil // This is the first run
+		}
 		return "", err
-	} else if !hasRow {
-		return "", errors.New("no revision found")
 	}
-
-	return stmt.GetText("version_num"), nil
+	return sqlitex.ResultText(stmt)
 }
 
 // Close disposes the driver.

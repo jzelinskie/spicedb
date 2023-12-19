@@ -11,8 +11,9 @@ import (
 
 	crdbmigrations "github.com/authzed/spicedb/internal/datastore/crdb/migrations"
 	mysqlmigrations "github.com/authzed/spicedb/internal/datastore/mysql/migrations"
-	"github.com/authzed/spicedb/internal/datastore/postgres/migrations"
+	pgmigrations "github.com/authzed/spicedb/internal/datastore/postgres/migrations"
 	spannermigrations "github.com/authzed/spicedb/internal/datastore/spanner/migrations"
+	sqlitemigrations "github.com/authzed/spicedb/internal/datastore/sqlite/migrations"
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/pkg/cmd/server"
 	"github.com/authzed/spicedb/pkg/cmd/termination"
@@ -41,71 +42,57 @@ func NewMigrateCommand(programName string) *cobra.Command {
 	}
 }
 
-func migrateRun(cmd *cobra.Command, args []string) error {
+func migrateRun(cmd *cobra.Command, args []string) (err error) {
+	ctx := cmd.Context()
 	datastoreEngine := cobrautil.MustGetStringExpanded(cmd, "datastore-engine")
 	dbURL := cobrautil.MustGetStringExpanded(cmd, "datastore-conn-uri")
 	timeout := cobrautil.MustGetDuration(cmd, "migration-timeout")
-	migrationBatachSize := cobrautil.MustGetUint64(cmd, "migration-backfill-batch-size")
+	migrationBatchSize := cobrautil.MustGetUint64(cmd, "migration-backfill-batch-size")
 
-	if datastoreEngine == "cockroachdb" {
-		log.Ctx(cmd.Context()).Info().Msg("migrating cockroachdb datastore")
-
-		var err error
-		migrationDriver, err := crdbmigrations.NewCRDBDriver(dbURL)
-		if err != nil {
-			return fmt.Errorf("unable to create migration driver for %s: %w", datastoreEngine, err)
-		}
-		return runMigration(cmd.Context(), migrationDriver, crdbmigrations.CRDBMigrations, args[0], timeout, migrationBatachSize)
-	} else if datastoreEngine == "postgres" {
-		log.Ctx(cmd.Context()).Info().Msg("migrating postgres datastore")
-
-		var err error
-		migrationDriver, err := migrations.NewAlembicPostgresDriver(cmd.Context(), dbURL)
-		if err != nil {
-			return fmt.Errorf("unable to create migration driver for %s: %w", datastoreEngine, err)
-		}
-		return runMigration(cmd.Context(), migrationDriver, migrations.DatabaseMigrations, args[0], timeout, migrationBatachSize)
-	} else if datastoreEngine == "spanner" {
-		log.Ctx(cmd.Context()).Info().Msg("migrating spanner datastore")
-
+	log.Ctx(ctx).Info().Str("engine", datastoreEngine).Msg("migrating datastore")
+	switch datastoreEngine {
+	case "cockroachdb":
+		driver, err := crdbmigrations.NewCRDBDriver(dbURL)
+		return runMigration(ctx, driver, err, crdbmigrations.CRDBMigrations, args[0], timeout, migrationBatchSize)
+	case "postgres":
+		driver, err := pgmigrations.NewAlembicPostgresDriver(cmd.Context(), dbURL)
+		return runMigration(ctx, driver, err, pgmigrations.DatabaseMigrations, args[0], timeout, migrationBatchSize)
+	case "sqlite":
+		manager := sqlitemigrations.SQLiteMigrations
+		driver, err := sqlitemigrations.NewAlembicSQLiteDriver(ctx, dbURL)
+		return runMigration(ctx, driver, err, manager, args[0], timeout, migrationBatchSize)
+	case "spanner":
 		credFile := cobrautil.MustGetStringExpanded(cmd, "datastore-spanner-credentials")
-		var err error
 		emulatorHost, err := cmd.Flags().GetString("datastore-spanner-emulator-host")
 		if err != nil {
-			log.Ctx(cmd.Context()).Fatal().Err(err).Msg("unable to get spanner emulator host")
+			log.Ctx(ctx).Fatal().Err(err).Msg("unable to get spanner emulator host")
 		}
-		migrationDriver, err := spannermigrations.NewSpannerDriver(cmd.Context(), dbURL, credFile, emulatorHost)
-		if err != nil {
-			return fmt.Errorf("unable to create migration driver for %s: %w", datastoreEngine, err)
-		}
-		return runMigration(cmd.Context(), migrationDriver, spannermigrations.SpannerMigrations, args[0], timeout, migrationBatachSize)
-	} else if datastoreEngine == "mysql" {
-		log.Ctx(cmd.Context()).Info().Msg("migrating mysql datastore")
-
-		var err error
+		driver, err := spannermigrations.NewSpannerDriver(cmd.Context(), dbURL, credFile, emulatorHost)
+		return runMigration(ctx, driver, err, spannermigrations.SpannerMigrations, args[0], timeout, migrationBatchSize)
+	case "mysql":
 		tablePrefix, err := cmd.Flags().GetString("datastore-mysql-table-prefix")
 		if err != nil {
-			log.Ctx(cmd.Context()).Fatal().Msg(fmt.Sprintf("unable to get table prefix: %s", err))
+			log.Ctx(ctx).Fatal().Err(err).Msg("unable to get table prefix")
 		}
-
-		migrationDriver, err := mysqlmigrations.NewMySQLDriverFromDSN(dbURL, tablePrefix)
-		if err != nil {
-			return fmt.Errorf("unable to create migration driver for %s: %w", datastoreEngine, err)
-		}
-		return runMigration(cmd.Context(), migrationDriver, mysqlmigrations.Manager, args[0], timeout, migrationBatachSize)
+		driver, err := mysqlmigrations.NewMySQLDriverFromDSN(dbURL, tablePrefix)
+		return runMigration(ctx, driver, err, mysqlmigrations.Manager, args[0], timeout, migrationBatchSize)
 	}
-
 	return fmt.Errorf("cannot migrate datastore engine type: %s", datastoreEngine)
 }
 
-func runMigration[D migrate.Driver[C, T], C any, T any](
+func runMigration[D migrate.Driver[C, T], C, T any](
 	ctx context.Context,
 	driver D,
+	driverErr error,
 	manager *migrate.Manager[D, C, T],
 	targetRevision string,
 	timeout time.Duration,
 	backfillBatchSize uint64,
 ) error {
+	if driverErr != nil {
+		return fmt.Errorf("unable to create migration driver: %w", driverErr)
+	}
+
 	log.Ctx(ctx).Info().Str("targetRevision", targetRevision).Msg("running migrations")
 	ctxWithBatch := context.WithValue(ctx, migrate.BackfillBatchSize, backfillBatchSize)
 	ctx, cancel := context.WithTimeout(ctxWithBatch, timeout)
@@ -147,11 +134,13 @@ func HeadRevision(engine string) (string, error) {
 	case "cockroachdb":
 		return crdbmigrations.CRDBMigrations.HeadRevision()
 	case "postgres":
-		return migrations.DatabaseMigrations.HeadRevision()
+		return pgmigrations.DatabaseMigrations.HeadRevision()
 	case "mysql":
 		return mysqlmigrations.Manager.HeadRevision()
 	case "spanner":
 		return spannermigrations.SpannerMigrations.HeadRevision()
+	case "sqlite":
+		return sqlitemigrations.SQLiteMigrations.HeadRevision()
 	default:
 		return "", fmt.Errorf("cannot migrate datastore engine type: %s", engine)
 	}

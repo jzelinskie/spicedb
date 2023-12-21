@@ -50,7 +50,7 @@ func (ds *ds) optimizedRevisionFunc(ctx context.Context) (rev datastore.Revision
 		SELECT MIN(id)
 		FROM txn
 		WHERE
-			time >= ROUND(strftime('%s', 'subsec') * 1000000000 / $quantization_nanos) * $quantization_nanos / 1000000000
+			time >= ROUND(CAST(unixepoch('subsec') * 1000000000 / $quantization_nanos) * $quantization_nanos / 1000000000
 	), (
 		SELECT MAX(id)
 		FROM id
@@ -71,22 +71,36 @@ func (ds *ds) optimizedRevisionFunc(ctx context.Context) (rev datastore.Revision
 	return rev, validFor, err
 }
 
-var queryTemplates = map[string]func(*sqliteOptions) string{
-	"CheckRevision": func(opts *sqliteOptions) string {
-		return fmt.Sprintf(`
-			SELECT $txid >= COALESCE((
-				SELECT MIN(id)
-				FROM   txn
-				WHERE  time >= TIMESTAMPADD(SECOND, %.6[1]f, UTC_TIMESTAMP(6))
-			), ( 
-		    	SELECT MAX(id)
-		    	FROM txn
-		    	LIMIT 1
-			)) as fresh, $txid > (
-				SELECT MAX(id)
-				FROM   txn
-			) as unknown;`, -1*opts.gcWindow.Seconds())
-	},
+func (ds *ds) queryCheckRevision(ctx context.Context, txnID int64) (fresh, unknown bool, err error) {
+	conn := ds.pool.Get(ctx)
+	if conn == nil {
+		err = errors.New("failed to get connection from pool")
+		return
+	}
+	defer ds.pool.Put(conn)
+	stmt := conn.Prep(`
+		SELECT $txid >= COALESCE(
+			(SELECT MIN(id)
+			 FROM txn
+			 WHERE time >= (CAST(unixepoch('subsec') * 1000 AS INTEGER) - $gc_window_ms)),
+			(SELECT MAX(id) FROM txn LIMIT 1)
+		) as fresh,
+		$txid > (SELECT MAX(id) FROM txn) AS unknown;
+	`)
+	stmt.SetInt64("$txid", txnID)
+	stmt.SetInt64("$gc_window_ms", ds.opts.gcWindow.Milliseconds())
+
+	freshInt, err := sqlitex.ResultInt(stmt)
+	if err != nil {
+		return fresh, unknown, err
+	}
+
+	unknownInt, err := sqlitex.ResultInt(stmt)
+	if err != nil {
+		return fresh, unknown, err
+	}
+
+	return freshInt == 1, unknownInt == 1, nil
 }
 
 func init() {
@@ -142,11 +156,6 @@ func NewDatastore(uri string, options ...Option) (datastore.Datastore, error) {
 		option(opts)
 	}
 
-	queries := make(map[string]string, len(queryTemplates))
-	for query, tmplfn := range queryTemplates {
-		queries[query] = tmplfn(opts)
-	}
-
 	flags := sqlite.SQLITE_OPEN_READWRITE |
 		sqlite.SQLITE_OPEN_CREATE |
 		sqlite.SQLITE_OPEN_WAL |
@@ -164,9 +173,8 @@ func NewDatastore(uri string, options ...Option) (datastore.Datastore, error) {
 	ds := &ds{
 		CachedOptimizedRevisions: revisions.NewCachedOptimizedRevisions(maxRevisionStaleness),
 
-		opts:    opts,
-		queries: queries,
-		pool:    p,
+		opts: opts,
+		pool: p,
 	}
 	ds.SetOptimizedRevisionFunc(ds.optimizedRevisionFunc)
 	return ds, nil
@@ -176,9 +184,8 @@ type ds struct {
 	revision.DecimalDecoder
 	*revisions.CachedOptimizedRevisions
 
-	opts    *sqliteOptions
-	queries map[string]string
-	pool    *sqlitex.Pool
+	opts *sqliteOptions
+	pool *sqlitex.Pool
 }
 
 func (ds *ds) CheckRevision(ctx context.Context, rev datastore.Revision) error {
@@ -186,48 +193,20 @@ func (ds *ds) CheckRevision(ctx context.Context, rev datastore.Revision) error {
 		return datastore.NewInvalidRevisionErr(rev, datastore.CouldNotDetermineRevision)
 	}
 
-	{
-		conn := ds.pool.Get(ctx)
-		if conn == nil {
-			return errors.New("failed to get connection from pool")
-		}
-		defer ds.pool.Put(conn)
-
-		_, span := tracer.Start(ctx, "CheckRevisionQuery")
-		defer span.End()
-
-		stmt := conn.Prep(ds.queries["CheckRevision"])
-		stmt.SetInt64("$txid", rev.(revision.Decimal).IntPart())
-
-		hasFresh, err := stmt.Step()
-		if err != nil {
-			return err
-		}
-		if !hasFresh {
-			return errors.New("failed to determine fresh")
-		}
-		if stmt.GetInt64("fresh") != 1 {
-			return datastore.NewInvalidRevisionErr(rev, datastore.RevisionStale)
-		}
-
-		hasUnknown, err := stmt.Step()
-		if err != nil {
-			return err
-		}
-		if !hasUnknown {
-			return errors.New("failed to determine unknown")
-		}
-		if stmt.GetInt64("unknown") == 1 {
-			return datastore.NewInvalidRevisionErr(rev, datastore.CouldNotDetermineRevision)
-		}
-
-		return nil
+	if fresh, unknown, err := ds.queryCheckRevision(ctx, rev.(revision.Decimal).IntPart()); err != nil {
+		return err
+	} else if !fresh {
+		return datastore.NewInvalidRevisionErr(rev, datastore.RevisionStale)
+	} else if unknown {
+		return datastore.NewInvalidRevisionErr(rev, datastore.CouldNotDetermineRevision)
 	}
+
+	return nil
 }
 
 func (ds *ds) Close() error { return ds.pool.Close() }
 
-func (ds *ds) Features(ctx context.Context) (*datastore.Features, error) {
+func (ds *ds) Features(_ context.Context) (*datastore.Features, error) {
 	return &datastore.Features{
 		Watch: datastore.Feature{Enabled: true},
 	}, nil

@@ -19,22 +19,34 @@ import (
 
 var tracer = otel.Tracer("spicedb/internal/datastore/sqlite")
 
-const deletedTxn = "9223372036854775807"
+const livingTxID = 9223372036854775807
 
 func (ds *ds) queryMetadataValue(conn *sqlite.Conn, key string) *sqlite.Stmt {
-	stmt := conn.Prep(`SELECT value FROM metadata WHERE key = $key;`)
+	stmt := conn.Prep(`
+		SELECT value
+		FROM metadata
+		WHERE key = $key;
+	`)
 	stmt.SetText("$key", key)
 	return stmt
 }
 
 func (ds *ds) queryEstRelCount(conn *sqlite.Conn) *sqlite.Stmt {
-	stmt := conn.Prep(`SELECT COUNT(id) FROM relationship WHERE deleted_txn = $deleted_txn;`)
-	stmt.SetText("$deleted_txn", deletedTxn)
+	stmt := conn.Prep(`
+		SELECT COUNT(id)
+		FROM relationship
+		WHERE deleted_txn = $living_txn;
+	`)
+	stmt.SetInt64("$living_txn", livingTxID)
 	return stmt
 }
 
 func (*ds) queryHeadRevision(conn *sqlite.Conn) *sqlite.Stmt {
-	return conn.Prep(`SELECT MAX(id) FROM txn LIMIT 1;`)
+	return conn.Prep(`
+		SELECT MAX(id)
+		FROM txn
+		LIMIT 1;
+	`)
 }
 
 func (ds *ds) optimizedRevisionFunc(ctx context.Context) (rev datastore.Revision, validFor time.Duration, err error) {
@@ -193,7 +205,7 @@ func (ds *ds) CheckRevision(ctx context.Context, rev datastore.Revision) error {
 		return datastore.NewInvalidRevisionErr(rev, datastore.CouldNotDetermineRevision)
 	}
 
-	if fresh, unknown, err := ds.queryCheckRevision(ctx, rev.(revision.Decimal).IntPart()); err != nil {
+	if fresh, unknown, err := ds.queryCheckRevision(ctx, revToTx(rev)); err != nil {
 		return err
 	} else if !fresh {
 		return datastore.NewInvalidRevisionErr(rev, datastore.RevisionStale)
@@ -235,23 +247,8 @@ func revFromTx(txid int64) (datastore.Revision, error) {
 	return revision.NewFromUint64(uint64(txid)), nil
 }
 
-func (ds *ds) OptimizedRevision(ctx context.Context) (datastore.Revision, error) {
-	conn := ds.pool.Get(ctx)
-	if conn == nil {
-		return nil, errors.New("failed to get connection from pool")
-	}
-	defer ds.pool.Put(conn)
-
-	stmt := conn.Prep(ds.queries["OptimizedRevision"])
-	hasRow, err := stmt.Step()
-	if err != nil {
-		return nil, err
-	}
-	if !hasRow {
-		return nil, errors.New("no transactions found")
-	}
-
-	return revFromTx(stmt.GetInt64("id"))
+func revToTx(rev datastore.Revision) int64 {
+	return rev.(revision.Decimal).IntPart()
 }
 
 func (*ds) ReadWriteTx(context.Context, datastore.TxUserFunc, ...options.RWTOptionsOption) (datastore.Revision, error) {

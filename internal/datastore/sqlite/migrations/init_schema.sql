@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS relationship (
   subject_type     TEXT NOT NULL,
   subject_id       TEXT NOT NULL,
   subject_relation TEXT NOT NULL,
+  caveat_name      TEXT,
+  caveat_context   TEXT,
   created_txn      INTEGER NOT NULL,
   deleted_txn      INTEGER NOT NULL DEFAULT 9223372036854775807,
   CONSTRAINT uq_relationship UNIQUE (

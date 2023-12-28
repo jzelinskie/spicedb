@@ -7,10 +7,11 @@ import (
 	"strconv"
 	"time"
 
-	"crawshaw.io/sqlite"
-	"crawshaw.io/sqlite/sqlitex"
 	"go.opentelemetry.io/otel"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 
+	"github.com/authzed/spicedb/internal/datastore/common"
 	"github.com/authzed/spicedb/internal/datastore/common/revisions"
 	"github.com/authzed/spicedb/pkg/datastore"
 	"github.com/authzed/spicedb/pkg/datastore/options"
@@ -21,35 +22,29 @@ var tracer = otel.Tracer("spicedb/internal/datastore/sqlite")
 
 const livingTxID = 9223372036854775807
 
-func (ds *ds) queryMetadataValue(conn *sqlite.Conn, key string) *sqlite.Stmt {
-	stmt := conn.Prep(`
-		SELECT value
-		FROM metadata
-		WHERE key = $key;
-	`)
+func (ds *sqliteDatastore) queryMetadataValue(conn *sqlite.Conn, key string) (string, error) {
+	stmt := conn.Prep(`SELECT value FROM metadata WHERE key = $key`)
 	stmt.SetText("$key", key)
-	return stmt
+	return sqlitex.ResultText(stmt)
 }
 
-func (ds *ds) queryEstRelCount(conn *sqlite.Conn) *sqlite.Stmt {
-	stmt := conn.Prep(`
-		SELECT COUNT(id)
-		FROM relationship
-		WHERE deleted_txn = $living_txn;
-	`)
+func (ds *sqliteDatastore) queryEstRelCount(conn *sqlite.Conn) (uint64, error) {
+	stmt := conn.Prep(`SELECT COUNT(id) FROM relationship WHERE deleted_txn = $living_txn`)
 	stmt.SetInt64("$living_txn", livingTxID)
-	return stmt
+	count, err := sqlitex.ResultInt64(stmt)
+	return uint64(count), err
 }
 
-func (*ds) queryHeadRevision(conn *sqlite.Conn) *sqlite.Stmt {
-	return conn.Prep(`
-		SELECT MAX(id)
-		FROM txn
-		LIMIT 1;
-	`)
+func (*sqliteDatastore) queryHeadRevision(conn *sqlite.Conn) (datastore.Revision, error) {
+	stmt := conn.Prep(`SELECT MAX(id) FROM txn LIMIT 1`)
+	txID, err := sqlitex.ResultInt64(stmt)
+	if err != nil {
+		return datastore.NoRevision, err
+	}
+	return revFromTx(txID)
 }
 
-func (ds *ds) optimizedRevisionFunc(ctx context.Context) (rev datastore.Revision, validFor time.Duration, err error) {
+func (ds *sqliteDatastore) optimizedRevisionFunc(ctx context.Context) (rev datastore.Revision, validFor time.Duration, err error) {
 	conn := ds.pool.Get(ctx)
 	if conn == nil {
 		err = errors.New("failed to get connection from pool")
@@ -57,62 +52,53 @@ func (ds *ds) optimizedRevisionFunc(ctx context.Context) (rev datastore.Revision
 	}
 	defer ds.pool.Put(conn)
 
-	stmt := conn.Prep(`
-	SELECT COALESCE ((
-		SELECT MIN(id)
-		FROM txn
-		WHERE
-			time >= ROUND(CAST(unixepoch('subsec') * 1000000000 / $quantization_nanos) * $quantization_nanos / 1000000000
-	), (
-		SELECT MAX(id)
-		FROM id
-	)) AS revision,
-	($quantization_nanos - strftime('%s', 'subsec') * 1000000000) % $quantization_nanos);
-	`)
-	stmt.SetText("$quantization_nanos", strconv.FormatInt(ds.opts.revisionQuantization.Nanoseconds(), 10))
-
-	if hasRow, stepErr := stmt.Step(); err != nil {
-		err = stepErr
-		return
-	} else if !hasRow {
-		panic("found no rows when executing optimizedRevisionFunc")
-	}
-
-	rev, err = revFromTx(stmt.ColumnInt64(0))
-	validFor = time.Duration(stmt.ColumnInt64(1))
+	err = sqlitex.Execute(conn, `SELECT COALESCE (
+		(SELECT MIN(id)
+		 FROM txn
+		 WHERE time >= CAST(unixepoch('subsec') * 1000000000 / $quantization_nanos AS INTEGER) * $quantization_nanos / 1000000000),
+		(SELECT MAX(id)
+		 FROM txn)
+	) AS revision,
+	($quantization_nanos - (unixepoch('subsec') * 1000000000)) % $quantization_nanos`,
+		&sqlitex.ExecOptions{
+			Named: map[string]any{
+				"$quantization_nanos": strconv.FormatInt(ds.opts.revisionQuantization.Nanoseconds(), 10),
+			},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				rev, err = revFromTx(stmt.ColumnInt64(0))
+				if err != nil {
+					return err
+				}
+				validFor = time.Duration(stmt.ColumnInt64(1))
+				return nil
+			},
+		},
+	)
 	return rev, validFor, err
 }
 
-func (ds *ds) queryCheckRevision(ctx context.Context, txnID int64) (fresh, unknown bool, err error) {
-	conn := ds.pool.Get(ctx)
-	if conn == nil {
-		err = errors.New("failed to get connection from pool")
-		return
-	}
-	defer ds.pool.Put(conn)
-	stmt := conn.Prep(`
-		SELECT $txid >= COALESCE(
+func (ds *sqliteDatastore) queryCheckRevision(conn *sqlite.Conn, rev datastore.Revision) (fresh, unknown bool, err error) {
+	err = sqlitex.Execute(conn,
+		`SELECT $txid >= COALESCE(
 			(SELECT MIN(id)
 			 FROM txn
 			 WHERE time >= (CAST(unixepoch('subsec') * 1000 AS INTEGER) - $gc_window_ms)),
 			(SELECT MAX(id) FROM txn LIMIT 1)
 		) as fresh,
-		$txid > (SELECT MAX(id) FROM txn) AS unknown;
-	`)
-	stmt.SetInt64("$txid", txnID)
-	stmt.SetInt64("$gc_window_ms", ds.opts.gcWindow.Milliseconds())
-
-	freshInt, err := sqlitex.ResultInt(stmt)
-	if err != nil {
-		return fresh, unknown, err
-	}
-
-	unknownInt, err := sqlitex.ResultInt(stmt)
-	if err != nil {
-		return fresh, unknown, err
-	}
-
-	return freshInt == 1, unknownInt == 1, nil
+		$txid > (SELECT MAX(id) FROM txn) AS unknown`,
+		&sqlitex.ExecOptions{
+			Named: map[string]any{
+				"$txid":         revToTx(rev),
+				"$gc_window_ms": ds.opts.gcWindow.Milliseconds(),
+			},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				fresh = stmt.GetInt64("fresh") == 1
+				unknown = stmt.GetInt64("unknown") == 1
+				return nil
+			},
+		},
+	)
+	return fresh, unknown, err
 }
 
 func init() {
@@ -168,11 +154,10 @@ func NewDatastore(uri string, options ...Option) (datastore.Datastore, error) {
 		option(opts)
 	}
 
-	flags := sqlite.SQLITE_OPEN_READWRITE |
-		sqlite.SQLITE_OPEN_CREATE |
-		sqlite.SQLITE_OPEN_WAL |
-		sqlite.SQLITE_OPEN_URI |
-		sqlite.SQLITE_OPEN_NOMUTEX
+	flags := sqlite.OpenReadWrite |
+		sqlite.OpenCreate |
+		sqlite.OpenWAL |
+		sqlite.OpenURI
 
 	p, err := sqlitex.Open(uri, flags, opts.poolSize)
 	if err != nil {
@@ -182,7 +167,7 @@ func NewDatastore(uri string, options ...Option) (datastore.Datastore, error) {
 	maxRevisionStaleness := time.Duration(float64(opts.revisionQuantization.Nanoseconds())*
 		opts.maxRevisionStalenessPercent) * time.Nanosecond
 
-	ds := &ds{
+	ds := &sqliteDatastore{
 		CachedOptimizedRevisions: revisions.NewCachedOptimizedRevisions(maxRevisionStaleness),
 
 		opts: opts,
@@ -192,7 +177,7 @@ func NewDatastore(uri string, options ...Option) (datastore.Datastore, error) {
 	return ds, nil
 }
 
-type ds struct {
+type sqliteDatastore struct {
 	revision.DecimalDecoder
 	*revisions.CachedOptimizedRevisions
 
@@ -200,12 +185,18 @@ type ds struct {
 	pool *sqlitex.Pool
 }
 
-func (ds *ds) CheckRevision(ctx context.Context, rev datastore.Revision) error {
+func (ds *sqliteDatastore) CheckRevision(ctx context.Context, rev datastore.Revision) error {
 	if rev == datastore.NoRevision {
 		return datastore.NewInvalidRevisionErr(rev, datastore.CouldNotDetermineRevision)
 	}
 
-	if fresh, unknown, err := ds.queryCheckRevision(ctx, revToTx(rev)); err != nil {
+	conn := ds.pool.Get(ctx)
+	if conn == nil {
+		return errors.New("failed to get connection from pool")
+	}
+	defer ds.pool.Put(conn)
+
+	if fresh, unknown, err := ds.queryCheckRevision(conn, rev); err != nil {
 		return err
 	} else if !fresh {
 		return datastore.NewInvalidRevisionErr(rev, datastore.RevisionStale)
@@ -216,27 +207,22 @@ func (ds *ds) CheckRevision(ctx context.Context, rev datastore.Revision) error {
 	return nil
 }
 
-func (ds *ds) Close() error { return ds.pool.Close() }
+func (ds *sqliteDatastore) Close() error { return ds.pool.Close() }
 
-func (ds *ds) Features(_ context.Context) (*datastore.Features, error) {
+func (ds *sqliteDatastore) Features(_ context.Context) (*datastore.Features, error) {
 	return &datastore.Features{
 		Watch: datastore.Feature{Enabled: true},
 	}, nil
 }
 
-func (ds *ds) HeadRevision(ctx context.Context) (datastore.Revision, error) {
+func (ds *sqliteDatastore) HeadRevision(ctx context.Context) (datastore.Revision, error) {
 	conn := ds.pool.Get(ctx)
 	if conn == nil {
 		return nil, errors.New("failed to get connection from pool")
 	}
 	defer ds.pool.Put(conn)
 
-	rev, err := sqlitex.ResultInt64(ds.queryHeadRevision(conn))
-	if err != nil {
-		return nil, err
-	}
-
-	return revFromTx(rev)
+	return ds.queryHeadRevision(conn)
 }
 
 func revFromTx(txid int64) (datastore.Revision, error) {
@@ -251,44 +237,98 @@ func revToTx(rev datastore.Revision) int64 {
 	return rev.(revision.Decimal).IntPart()
 }
 
-func (*ds) ReadWriteTx(context.Context, datastore.TxUserFunc, ...options.RWTOptionsOption) (datastore.Revision, error) {
-	panic("unimplemented")
-}
-
-func (*ds) ReadyState(_ context.Context) (datastore.ReadyState, error) {
+func (*sqliteDatastore) ReadyState(_ context.Context) (datastore.ReadyState, error) {
 	return datastore.ReadyState{IsReady: true}, nil
 }
 
-func (*ds) SnapshotReader(datastore.Revision) datastore.Reader { panic("unimplemented") }
+func (ds *sqliteDatastore) SnapshotReader(rev datastore.Revision) datastore.Reader {
+	// This is nil-checked by the reader because it cannot be done here.
+	conn := ds.pool.Get(context.Background())
+	return &sqliteReader{
+		conn:     conn,
+		snapshot: &rev,
+		executor: common.QueryExecutor{Executor: newSQLiteExecutor(conn)},
+	}
+}
 
-func (ds *ds) Statistics(ctx context.Context) (datastore.Stats, error) {
+func queryCreateTxn(conn *sqlite.Conn) (rev datastore.Revision, err error) {
+	err = sqlitex.Execute(
+		conn,
+		"INSERT INTO txn (time) SELECT unixepoch('subsec') * 1000 RETURNING id",
+		&sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) (resultErr error) {
+				rev, resultErr = revFromTx(stmt.GetInt64("id"))
+				return resultErr
+			},
+		},
+	)
+	return rev, err
+}
+
+func (ds *sqliteDatastore) ReadWriteTx(ctx context.Context, txnFn datastore.TxUserFunc, opts ...options.RWTOptionsOption) (rev datastore.Revision, err error) {
+	conn := ds.pool.Get(ctx)
+	if conn == nil {
+		return datastore.NoRevision, errors.New("failed to get connection from pool")
+	}
+	defer ds.pool.Put(conn)
+	defer sqlitex.Save(conn)(&err)
+
+	// TODO(jzelinskie): add retry logic
+	// config := options.NewRWTOptionsWithOptions(opts...)
+
+	fmt.Println("createTxn")
+	rev, err = queryCreateTxn(conn)
+	if err != nil {
+		return datastore.NoRevision, err
+	}
+	fmt.Println("/createTxn")
+
+	err = txnFn(ctx, &sqliteReaderWriter{
+		sqliteReader: &sqliteReader{
+			conn:     conn,
+			snapshot: nil,
+			executor: common.QueryExecutor{Executor: newSQLiteExecutor(conn)},
+		},
+		txID: revToTx(rev),
+	})
+	return rev, err
+}
+
+func (ds *sqliteDatastore) Statistics(ctx context.Context) (datastore.Stats, error) {
 	conn := ds.pool.Get(ctx)
 	if conn == nil {
 		return datastore.Stats{}, errors.New("failed to get connection from pool")
 	}
 	defer ds.pool.Put(conn)
 
-	datastoreID, err := sqlitex.ResultText(ds.queryMetadataValue(conn, "datastore_id"))
+	datastoreID, err := ds.queryMetadataValue(conn, "datastore_id")
 	if err != nil {
 		return datastore.Stats{}, fmt.Errorf("failed querying unique datastore ID: %w", err)
 	}
 
-	estRelCount, err := sqlitex.ResultInt64(ds.queryEstRelCount(conn))
+	estRelCount, err := ds.queryEstRelCount(conn)
 	if err != nil {
 		return datastore.Stats{}, fmt.Errorf("failed querying estimated relationship count: %w", err)
 	}
 
-	nsDefs := []datastore.RevisionedNamespace{} // TODO(jzelinskie): implement loading namespaces
+	nsDefs, err := (&sqliteReader{
+		conn:     conn,
+		snapshot: nil,
+		executor: common.QueryExecutor{Executor: newSQLiteExecutor(conn)},
+	}).ListAllNamespaces(ctx)
+	if err != nil {
+		return datastore.Stats{}, fmt.Errorf("failed querying namespaces: %w", err)
+	}
 
 	return datastore.Stats{
 		UniqueID:                   datastoreID,
-		EstimatedRelationshipCount: uint64(estRelCount),
+		EstimatedRelationshipCount: estRelCount,
 		ObjectTypeStatistics:       datastore.ComputeObjectTypeStats(nsDefs),
 	}, nil
 }
 
-func (*ds) Watch(ctx context.Context, afterRevision datastore.Revision) (<-chan *datastore.RevisionChanges, <-chan error) {
+func (*sqliteDatastore) Watch(ctx context.Context, afterRevision datastore.Revision) (<-chan *datastore.RevisionChanges, <-chan error) {
 	panic("unimplemented")
 }
 
-var _ datastore.Datastore = (*ds)(nil)
+var _ datastore.Datastore = (*sqliteDatastore)(nil)

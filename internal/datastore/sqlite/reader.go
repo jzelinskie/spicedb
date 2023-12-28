@@ -2,10 +2,14 @@ package sqlite
 
 import (
 	"context"
-	"fmt"
-	"strings"
+	"encoding/json"
+	"errors"
 
-	"crawshaw.io/sqlite"
+	sq "github.com/Masterminds/squirrel"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
+
+	"github.com/authzed/spicedb/internal/datastore/common"
 	"github.com/authzed/spicedb/pkg/datastore"
 	"github.com/authzed/spicedb/pkg/datastore/options"
 	corev1 "github.com/authzed/spicedb/pkg/proto/core/v1"
@@ -14,132 +18,163 @@ import (
 type sqliteReader struct {
 	conn     *sqlite.Conn
 	snapshot *datastore.Revision
+	executor common.QueryExecutor
 }
 
-func (r *sqliteReader) queryLivingNamespaces(names ...string) ([]datastore.RevisionedNamespace, error) {
-	var nameFilter string
-	if len(names) > 0 {
-		nameFilter = fmt.Sprintf(" AND name IN (%s)", strings.Join(names, ", "))
+func newSQLiteExecutor(conn *sqlite.Conn) common.ExecuteQueryFunc {
+	return func(ctx context.Context, sqlQuery string, args []any) ([]*corev1.RelationTuple, error) {
+		var rels []*corev1.RelationTuple
+		err := sqlitex.Execute(conn, sqlQuery, &sqlitex.ExecOptions{
+			Args: args,
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				var caveatContext map[string]any
+				if cc := stmt.GetText("caveat_context"); cc != "" {
+					if err := json.Unmarshal([]byte(cc), &caveatContext); err != nil {
+						return err
+					}
+				}
+
+				caveatName := stmt.GetText("caveat_name")
+				caveat, err := common.ContextualizedCaveatFrom(caveatName, caveatContext)
+				if err != nil {
+					return err
+				}
+
+				rels = append(rels, &corev1.RelationTuple{
+					ResourceAndRelation: &corev1.ObjectAndRelation{
+						Namespace: stmt.GetText("object_type"),
+						ObjectId:  stmt.GetText("object_id"),
+						Relation:  stmt.GetText("object_relation"),
+					},
+					Subject: &corev1.ObjectAndRelation{
+						Namespace: stmt.GetText("subject_type"),
+						ObjectId:  stmt.GetText("subject_id"),
+						Relation:  stmt.GetText("subject_relation"),
+					},
+					Caveat: caveat,
+				})
+				return nil
+			},
+		})
+
+		return rels, err
+	}
+}
+
+func queryNamespaces(conn *sqlite.Conn, rev *datastore.Revision, names ...string) (namespaces []datastore.RevisionedNamespace, err error) {
+	if conn == nil {
+		return nil, errors.New("failed to get connection from pool")
 	}
 
-	stmt := r.conn.Prep(`
-		SELECT serialized_config, created_txn
-		FROM namespace
-		WHERE deleted_txn = $living_txid
-	` + nameFilter + ";")
-	stmt.SetInt64("$living_txn", livingTxID)
+	sb := sq.Select("serialized_config", "created_txn").From("namespace")
 
-	return scanNamespaces(stmt)
-}
-
-func (r *sqliteReader) queryNamespacesAtSnapshot(names ...string) ([]datastore.RevisionedNamespace, error) {
-	var nameFilter string
-	if len(names) > 0 {
-		nameFilter = fmt.Sprintf(" AND name IN (%s)", strings.Join(names, ", "))
+	// Add the clauses to query at a snapshot or fully consistent.
+	if rev != nil {
+		txid := revToTx(*rev)
+		sb = sb.Where(sq.And{
+			sq.LtOrEq{"created_txn": txid},
+			sq.Or{
+				sq.Eq{"deleted_txn": livingTxID},
+				sq.Gt{"deleted_txn": txid},
+			},
+		})
+	} else {
+		sb = sb.Where(sq.Eq{"deleted_txn": livingTxID})
 	}
 
-	stmt := r.conn.Prep(`
-		SELECT serialized_config, created_txn
-		FROM namespace
-		WHERE created_txn <= $txid
-		AND (
-			deleted_txn = $living_txn
-			OR deleted_txn > $txid
-		)
-	` + nameFilter + ";")
-	stmt.SetInt64("$living_txn", livingTxID)
-	stmt.SetInt64("$txid", revToTx(*r.snapshot))
+	// Add the clauses for filtering by name.
+	if len(names) > 0 {
+		namesClause := sq.Or{}
+		for _, name := range names {
+			namesClause = append(namesClause, sq.Eq{"name": name})
+		}
+		sb = sb.Where(namesClause)
+	}
 
-	return scanNamespaces(stmt)
-}
+	query, values, err := sb.ToSql()
+	if err != nil {
+		return nil, err
+	}
 
-func scanNamespaces(stmt *sqlite.Stmt) (namespaces []datastore.RevisionedNamespace, err error) {
 	var buf []byte
-	for {
-		if hasRow, err := stmt.Step(); err != nil {
-			return nil, err
-		} else if !hasRow {
-			break
-		}
+	err = sqlitex.Execute(conn, query, &sqlitex.ExecOptions{
+		Args:       values,
+		ResultFunc: scanNamespace(namespaces, buf),
+	})
+	return namespaces, err
+}
 
+func scanNamespace(namespaces []datastore.RevisionedNamespace, scratchBuf []byte) execResultFunc {
+	return func(stmt *sqlite.Stmt) error {
 		namespace := &corev1.NamespaceDefinition{}
-		stmt.GetBytes("serialized_config", buf)
-		if err := namespace.UnmarshalVT(buf); err != nil {
-			return nil, err
+		stmt.GetBytes("serialized_config", scratchBuf)
+		if err := namespace.UnmarshalVT(scratchBuf); err != nil {
+			return err
 		}
-		clear(buf)
+		scratchBuf = scratchBuf[:0] // Reset the buffer
 
 		rev, err := revFromTx(stmt.GetInt64("created_txn"))
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		namespaces = append(namespaces, datastore.RevisionedNamespace{
 			Definition:          namespace,
 			LastWrittenRevision: rev,
 		})
-
+		return nil
 	}
-	return namespaces, nil
 }
 
-func (r *sqliteReader) queryLivingCaveats(names ...string) ([]datastore.RevisionedCaveat, error) {
-	var nameFilter string
-	if len(names) > 0 {
-		nameFilter = fmt.Sprintf(" WHERE name IN (%s)", strings.Join(names, ", "))
+func queryCaveats(conn *sqlite.Conn, rev *datastore.Revision, names ...string) (caveats []datastore.RevisionedCaveat, err error) {
+	if conn == nil {
+		return nil, errors.New("failed to get connection from pool")
 	}
 
-	stmt := r.conn.Prep(`
-		SELECT expression, created_txn
-		FROM caveat
-		WHERE deleted_txn = $living_txid
-		ORDER BY name
-	` + nameFilter + ";")
-	stmt.SetInt64("$living_txn", livingTxID)
+	sb := sq.Select("expression", "created_txn").From("caveat").OrderBy("name")
 
-	return scanCaveats(stmt)
-}
-
-func (r *sqliteReader) queryCaveatsAtSnapshot(names ...string) ([]datastore.RevisionedCaveat, error) {
-	var nameFilter string
-	if len(names) > 0 {
-		nameFilter = fmt.Sprintf(" AND name IN (%s)", strings.Join(names, ", "))
+	if rev != nil {
+		txID := revToTx(*rev)
+		sb = sb.Where(sq.And{
+			sq.LtOrEq{"created_txn": txID},
+			sq.Or{
+				sq.Eq{"deleted_txn": livingTxID},
+				sq.Gt{"deleted_txn": txID},
+			},
+		})
+	} else {
+		sb = sb.Where(sq.Eq{"deleted_txn": livingTxID})
 	}
 
-	stmt := r.conn.Prep(`
-		SELECT expression, created_txn
-		FROM caveat
-		WHERE created_txn <= $txid
-		AND (
-			deleted_txn = $living_txn
-			OR deleted_txn > $txid
-		)
-	` + nameFilter + " ORDER BY name;")
-	stmt.SetInt64("$living_txn", livingTxID)
-	stmt.SetInt64("$txid", revToTx(*r.snapshot))
+	query, values, err := sb.ToSql()
+	if err != nil {
+		return nil, err
+	}
 
-	return scanCaveats(stmt)
-}
-
-func scanCaveats(stmt *sqlite.Stmt) (caveats []datastore.RevisionedCaveat, err error) {
 	var buf []byte
-	for {
-		if hasRow, err := stmt.Step(); err != nil {
-			return nil, err
-		} else if !hasRow {
-			break
-		}
+	err = sqlitex.Execute(conn, query, &sqlitex.ExecOptions{
+		Args:       values,
+		ResultFunc: scanCaveat(caveats, buf),
+	})
+	return caveats, err
+}
 
+// execResultFunc is the callback used by sqlitex.Exec after each successful
+// row returned from a *sqlite.Stmt.
+type execResultFunc func(*sqlite.Stmt) error
+
+func scanCaveat(caveats []datastore.RevisionedCaveat, scratchBuf []byte) execResultFunc {
+	return func(stmt *sqlite.Stmt) error {
 		caveat := &corev1.CaveatDefinition{}
-		stmt.GetBytes("expression", buf)
-		if err := caveat.UnmarshalVT(buf); err != nil {
-			return nil, err
+		stmt.GetBytes("expression", scratchBuf)
+		if err := caveat.UnmarshalVT(scratchBuf); err != nil {
+			return err
 		}
-		clear(buf)
+		scratchBuf = scratchBuf[:0] // Reset the buffer
 
 		rev, err := revFromTx(stmt.GetInt64("created_txn"))
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		caveats = append(caveats, datastore.RevisionedCaveat{
@@ -147,36 +182,26 @@ func scanCaveats(stmt *sqlite.Stmt) (caveats []datastore.RevisionedCaveat, err e
 			LastWrittenRevision: rev,
 		})
 
+		return nil
 	}
-	return caveats, nil
 }
 
 // ListAllCaveats implements datastore.Reader.
-func (r *sqliteReader) ListAllCaveats(_ context.Context) ([]datastore.RevisionedDefinition[*corev1.CaveatDefinition], error) {
-	if r.snapshot != nil {
-		return r.queryCaveatsAtSnapshot()
-	}
-	return r.queryLivingCaveats()
+func (r *sqliteReader) ListAllCaveats(ctx context.Context) ([]datastore.RevisionedCaveat, error) {
+	return queryCaveats(r.conn, r.snapshot)
 }
 
 // LookupCaveatsWithNames implements datastore.Reader.
-func (r *sqliteReader) LookupCaveatsWithNames(_ context.Context, names []string) ([]datastore.RevisionedDefinition[*corev1.CaveatDefinition], error) {
+func (r *sqliteReader) LookupCaveatsWithNames(ctx context.Context, names []string) ([]datastore.RevisionedCaveat, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
-
-	if r.snapshot != nil {
-		return r.queryCaveatsAtSnapshot(names...)
-	}
-	return r.queryLivingCaveats(names...)
+	return queryCaveats(r.conn, r.snapshot, names...)
 }
 
 // ListAllNamespaces implements datastore.Reader.
-func (r *sqliteReader) ListAllNamespaces(_ context.Context) ([]datastore.RevisionedDefinition[*corev1.NamespaceDefinition], error) {
-	if r.snapshot != nil {
-		return r.queryNamespacesAtSnapshot()
-	}
-	return r.queryLivingNamespaces()
+func (r *sqliteReader) ListAllNamespaces(ctx context.Context) ([]datastore.RevisionedDefinition[*corev1.NamespaceDefinition], error) {
+	return queryNamespaces(r.conn, r.snapshot)
 }
 
 // LookupNamespacesWithNames implements datastore.Reader.
@@ -184,31 +209,97 @@ func (r *sqliteReader) LookupNamespacesWithNames(ctx context.Context, nsNames []
 	if len(nsNames) == 0 {
 		return nil, nil
 	}
-
-	if r.snapshot != nil {
-		return r.queryNamespacesAtSnapshot(nsNames...)
-	}
-	return r.queryLivingNamespaces(nsNames...)
+	return queryNamespaces(r.conn, r.snapshot, nsNames...)
 }
+
+var schema = common.NewSchemaInformation(
+	"object_type",
+	"object_id",
+	"object_relation",
+	"subject_type",
+	"subject_id",
+	"subject_relation",
+	"caveat",
+	common.ExpandedLogicComparison,
+)
+
+var queryTuples = sq.Select(
+	"object_type", "object_id", "object_relation",
+	"subject_type", "subject_id", "subject_relation",
+	"caveat_name", "caveat_context",
+).From("relationship")
 
 // QueryRelationships implements datastore.Reader.
-func (*sqliteReader) QueryRelationships(ctx context.Context, filter datastore.RelationshipsFilter, options ...options.QueryOptionsOption) (datastore.RelationshipIterator, error) {
-	panic("unimplemented")
-}
+func (r *sqliteReader) QueryRelationships(ctx context.Context, filter datastore.RelationshipsFilter, opts ...options.QueryOptionsOption) (datastore.RelationshipIterator, error) {
+	if r.conn == nil {
+		return nil, errors.New("failed to get connection from pool")
+	}
 
-// ReadCaveatByName implements datastore.Reader.
-func (*sqliteReader) ReadCaveatByName(ctx context.Context, name string) (caveat *corev1.CaveatDefinition, lastWritten datastore.Revision, err error) {
-	panic("unimplemented")
-}
-
-// ReadNamespaceByName implements datastore.Reader.
-func (*sqliteReader) ReadNamespaceByName(ctx context.Context, nsName string) (ns *corev1.NamespaceDefinition, lastWritten datastore.Revision, err error) {
-	panic("unimplemented")
+	b, err := common.NewSchemaQueryFilterer(schema, queryTuples).
+		FilterWithRelationshipsFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	return r.executor.ExecuteQuery(ctx, b, opts...)
 }
 
 // ReverseQueryRelationships implements datastore.Reader.
-func (*sqliteReader) ReverseQueryRelationships(ctx context.Context, subjectsFilter datastore.SubjectsFilter, options ...options.ReverseQueryOptionsOption) (datastore.RelationshipIterator, error) {
-	panic("unimplemented")
+func (r *sqliteReader) ReverseQueryRelationships(ctx context.Context, subjectsFilter datastore.SubjectsFilter, opts ...options.ReverseQueryOptionsOption) (datastore.RelationshipIterator, error) {
+	if r.conn == nil {
+		return nil, errors.New("failed to get connection from pool")
+	}
+
+	b, err := common.NewSchemaQueryFilterer(schema, queryTuples).
+		FilterWithSubjectsSelectors(subjectsFilter.AsSelector())
+	if err != nil {
+		return nil, err
+	}
+
+	queryOpts := options.NewReverseQueryOptionsWithOptions(opts...)
+	if queryOpts.ResRelation != nil {
+		b = b.FilterToResourceType(queryOpts.ResRelation.Namespace).
+			FilterToRelation(queryOpts.ResRelation.Relation)
+	}
+
+	return r.executor.ExecuteQuery(ctx, b,
+		options.WithLimit(queryOpts.LimitForReverse),
+		options.WithAfter(queryOpts.AfterForReverse),
+		options.WithSort(queryOpts.SortForReverse),
+	)
+}
+
+// ReadCaveatByName implements datastore.Reader.
+func (r *sqliteReader) ReadCaveatByName(ctx context.Context, name string) (caveat *corev1.CaveatDefinition, lastWritten datastore.Revision, err error) {
+	caveats, err := queryCaveats(r.conn, r.snapshot, name)
+	if err != nil {
+		return nil, datastore.NoRevision, err
+	}
+
+	switch len(caveats) {
+	case 0:
+		return nil, datastore.NoRevision, datastore.NewCaveatNameNotFoundErr(name)
+	case 1:
+		return caveats[0].Definition, caveats[0].LastWrittenRevision, nil
+	default:
+		panic("found multiple caveats with name: " + name)
+	}
+}
+
+// ReadNamespaceByName implements datastore.Reader.
+func (r *sqliteReader) ReadNamespaceByName(ctx context.Context, name string) (ns *corev1.NamespaceDefinition, lastWritten datastore.Revision, err error) {
+	namespaces, err := queryNamespaces(r.conn, r.snapshot, name)
+	if err != nil {
+		return nil, datastore.NoRevision, err
+	}
+
+	switch len(namespaces) {
+	case 0:
+		return nil, datastore.NoRevision, datastore.NewNamespaceNotFoundErr(name)
+	case 1:
+		return namespaces[0].Definition, namespaces[0].LastWrittenRevision, nil
+	default:
+		panic("found multiple namespaces with name: " + name)
+	}
 }
 
 var _ datastore.Reader = (*sqliteReader)(nil)

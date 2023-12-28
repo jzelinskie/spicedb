@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"crawshaw.io/sqlite"
-	"crawshaw.io/sqlite/sqlitex"
 	"github.com/authzed/spicedb/pkg/migrate"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 
 	"go.opentelemetry.io/otel"
 )
@@ -61,7 +61,6 @@ func (d *AlembicSQLiteDriver) Version(ctx context.Context) (string, error) {
 	stmt, err := d.db.Prepare("SELECT version_num FROM alembic_version")
 	if err != nil {
 		if strings.Contains(err.Error(), "no such table") {
-			fmt.Println(err.Error())
 			return "", nil // This is the first run
 		}
 		return "", err

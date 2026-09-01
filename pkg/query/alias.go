@@ -178,12 +178,18 @@ func (a *AliasIterator) CheckImpl(ctx *Context, resource Object, subject ObjectA
 	if err != nil {
 		return nil, err
 	}
+	return a.resolveCheckPath(subPath, resource, subject), nil
+}
 
+// resolveCheckPath turns one sub-iterator check result into this alias's
+// result: a found path is relabeled with the alias's outermost name, and a miss
+// falls back to the self edge when the resource is the subject.
+func (a *AliasIterator) resolveCheckPath(subPath *Path, resource Object, subject ObjectAndRelation) *Path {
 	rel := a.effectiveRelation()
 	if subPath != nil {
 		// We have a path! Even if it's caveated, rewrite it and return.
 		subPath.Relation = rel
-		return subPath, nil
+		return subPath
 	}
 
 	// We have no sub-path. Check for the self edge: the resource matches the subject
@@ -191,22 +197,57 @@ func (a *AliasIterator) CheckImpl(ctx *Context, resource Object, subject ObjectA
 	// In an uncollapsed chain each Alias level fires its own self-edge; the collapsed
 	// node must honor every name in the chain to preserve those semantics.
 	if resource.ObjectID != subject.ObjectID || resource.ObjectType != subject.ObjectType {
-		return nil, nil
+		return nil
 	}
 	if !a.matchesSelfEdgeRelation(subject.Relation) {
-		return nil, nil
+		return nil
 	}
 
 	// Build the synthetic self-edge path. The resource is labeled with the outermost
 	// name (what the user asked about); the subject is the user's subject as-is.
-	selfPath := &Path{
+	return &Path{
 		Resource: GetObject(resource.WithRelation(rel)),
 		Relation: rel,
 		Subject:  subject,
 		Metadata: make(map[string]any),
 	}
+}
 
-	return selfPath, nil
+// CheckManySubjectsImpl passes the batch through to the sub-iterator so it can
+// be answered in one datastore query, then applies the alias relabeling and
+// self-edge fallback to each result.
+func (a *AliasIterator) CheckManySubjectsImpl(ctx *Context, resource Object, subjects []ObjectAndRelation) ([]*Path, error) {
+	subPaths, err := ctx.CheckManySubjects(a.subIt, resource, subjects)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Path, len(subjects))
+	for i, subject := range subjects {
+		var subPath *Path
+		if i < len(subPaths) {
+			subPath = subPaths[i]
+		}
+		out[i] = a.resolveCheckPath(subPath, resource, subject)
+	}
+	return out, nil
+}
+
+// CheckManyResourcesImpl is the resource-axis counterpart of
+// CheckManySubjectsImpl.
+func (a *AliasIterator) CheckManyResourcesImpl(ctx *Context, resources []Object, subject ObjectAndRelation) ([]*Path, error) {
+	subPaths, err := ctx.CheckManyResources(a.subIt, resources, subject)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Path, len(resources))
+	for i, resource := range resources {
+		var subPath *Path
+		if i < len(subPaths) {
+			subPath = subPaths[i]
+		}
+		out[i] = a.resolveCheckPath(subPath, resource, subject)
+	}
+	return out, nil
 }
 
 func (a *AliasIterator) IterSubjectsImpl(ctx *Context, resource Object, filterSubjectType ObjectType) (PathSeq, error) {

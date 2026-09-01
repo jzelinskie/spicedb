@@ -18,6 +18,24 @@ const WildcardObjectID = tuple.PublicWildcard
 // at least one row exists.
 var limitOne uint64 = 1
 
+// CheckFilter selects the relationships a check needs: those connecting any of
+// ResourceIDs to any of SubjectIDs, under a fixed relation on each side.
+//
+// Both axes are slices so that CheckManyResources (many resources, one subject)
+// and CheckManySubjects (one resource, many subjects) collapse into a single
+// datastore query rather than one per element. A plain Check passes one ID on
+// each side. SubjectIDs may contain WildcardObjectID for wildcard checks.
+type CheckFilter struct {
+	ResourceType     string
+	ResourceIDs      []string
+	ResourceRelation string
+	SubjectType      string
+	SubjectIDs       []string
+	SubjectRelation  string
+	WithCaveats      bool
+	WithExpiration   bool
+}
+
 // QueryPage bundles pagination parameters for QuerySubjects and QueryResources.
 type QueryPage struct {
 	Limit  *uint64
@@ -28,16 +46,10 @@ type QueryPage struct {
 // It exposes only the four logical operations actually performed by this package,
 // returning PathSeq values directly so callers never touch raw relationship iterators.
 type QueryDatastoreReader interface {
-	// CheckRelationships finds paths for a specific resource matched against a subject.
-	// subject.ObjectID may be WildcardObjectID for wildcard checks.
-	CheckRelationships(
-		ctx context.Context,
-		resourceType ObjectType,
-		resourceID string,
-		resourceRelation string,
-		subject ObjectAndRelation,
-		withCaveats, withExpiration bool,
-	) (PathSeq, error)
+	// CheckRelationships finds paths matching the given filter. Both the
+	// resource and subject axes are plural so that a batched check reaches the
+	// datastore as a single query; a scalar check passes single-element slices.
+	CheckRelationships(ctx context.Context, filter CheckFilter) (PathSeq, error)
 
 	// QuerySubjects finds all subject paths for a resource.
 	// If resource.ObjectID is empty, no resource ID filter is applied (wildcard expansion).
@@ -115,30 +127,23 @@ func buildSubjectRelationFilter(subrelation string) datastore.SubjectRelationFil
 	return datastore.SubjectRelationFilter{}.WithNonEllipsisRelation(subrelation)
 }
 
-func (r *datalayerQueryDatastoreReader) CheckRelationships(
-	ctx context.Context,
-	resourceType ObjectType,
-	resourceID string,
-	resourceRelation string,
-	subject ObjectAndRelation,
-	withCaveats, withExpiration bool,
-) (PathSeq, error) {
+func (r *datalayerQueryDatastoreReader) CheckRelationships(ctx context.Context, check CheckFilter) (PathSeq, error) {
 	filter := datastore.RelationshipsFilter{
-		OptionalResourceType:     resourceType.Type,
-		OptionalResourceIds:      []string{resourceID},
-		OptionalResourceRelation: resourceRelation,
+		OptionalResourceType:     check.ResourceType,
+		OptionalResourceIds:      check.ResourceIDs,
+		OptionalResourceRelation: check.ResourceRelation,
 		OptionalSubjectsSelectors: []datastore.SubjectsSelector{
 			{
-				OptionalSubjectType: subject.ObjectType,
-				OptionalSubjectIds:  []string{subject.ObjectID},
-				RelationFilter:      buildSubjectRelationFilter(subject.Relation),
+				OptionalSubjectType: check.SubjectType,
+				OptionalSubjectIds:  check.SubjectIDs,
+				RelationFilter:      buildSubjectRelationFilter(check.SubjectRelation),
 			},
 		},
 	}
 
 	relIter, err := r.inner.QueryRelationships(ctx, filter,
-		options.WithSkipCaveats(!withCaveats),
-		options.WithSkipExpiration(!withExpiration),
+		options.WithSkipCaveats(!check.WithCaveats),
+		options.WithSkipExpiration(!check.WithExpiration),
 		options.WithQueryShape(queryshape.CheckPermissionSelectDirectSubjects),
 	)
 	if err != nil {

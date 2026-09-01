@@ -621,48 +621,56 @@ func (ld *localDispatcher) DispatchQueryPlan(
 		return nil
 
 	case v1.PlanOperation_PLAN_OPERATION_CHECK_MANY_RESOURCES:
-		// Iterate CheckImpl directly: dispatch boundary already crossed for this
-		// alias. qctx still uses DispatchExecutor, so nested aliases re-dispatch.
+		// Run the batch against the local tree: the dispatch boundary has already
+		// been crossed for this alias. qctx still uses DispatchExecutor, so nested
+		// aliases re-dispatch. CheckManyResourcesOn keeps the batch intact where the
+		// tree supports it, so the sender's fan-out costs one datastore query rather
+		// than one per resource.
+		resources := make([]query.Object, 0, len(req.Many))
 		for _, res := range req.Many {
-			resource := query.Object{ObjectType: res.Namespace, ObjectID: res.ObjectId}
-			path, err := it.CheckImpl(qctx, resource, subject)
-			if err != nil {
-				return err
-			}
-			if path != nil {
-				if err := stream.Publish(&v1.DispatchQueryPlanResponse{
-					Paths: []*v1.ResultPath{dispatch.QueryPathToResultPath(path)},
-				}); err != nil {
-					return err
-				}
-			}
+			resources = append(resources, query.Object{ObjectType: res.Namespace, ObjectID: res.ObjectId})
 		}
-		return nil
+		paths, err := query.CheckManyResourcesOn(qctx, it, resources, subject)
+		if err != nil {
+			return err
+		}
+		return publishFoundPaths(stream, paths)
 
 	case v1.PlanOperation_PLAN_OPERATION_CHECK_MANY_SUBJECTS:
+		subjects := make([]query.ObjectAndRelation, 0, len(req.Many))
 		for _, sub := range req.Many {
-			subject := query.ObjectAndRelation{
+			subjects = append(subjects, query.ObjectAndRelation{
 				ObjectType: sub.Namespace,
 				ObjectID:   sub.ObjectId,
 				Relation:   sub.Relation,
-			}
-			path, err := it.CheckImpl(qctx, resource, subject)
-			if err != nil {
-				return err
-			}
-			if path != nil {
-				if err := stream.Publish(&v1.DispatchQueryPlanResponse{
-					Paths: []*v1.ResultPath{dispatch.QueryPathToResultPath(path)},
-				}); err != nil {
-					return err
-				}
-			}
+			})
 		}
-		return nil
+		paths, err := query.CheckManySubjectsOn(qctx, it, resource, subjects)
+		if err != nil {
+			return err
+		}
+		return publishFoundPaths(stream, paths)
 
 	default:
 		return fmt.Errorf("DispatchQueryPlan: unknown operation %v", req.Operation)
 	}
+}
+
+// publishFoundPaths streams the non-nil entries of a batched check result. The
+// nil entries are misses; the sender re-indexes what it receives by resource or
+// subject, so the gaps need no placeholder.
+func publishFoundPaths(stream dispatch.PlanStream, paths []*query.Path) error {
+	for _, path := range paths {
+		if path == nil {
+			continue
+		}
+		if err := stream.Publish(&v1.DispatchQueryPlanResponse{
+			Paths: []*v1.ResultPath{dispatch.QueryPathToResultPath(path)},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // deserializePlanFromRequest loads the schema at the requested revision and

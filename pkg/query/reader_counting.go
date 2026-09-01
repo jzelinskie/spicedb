@@ -72,16 +72,10 @@ func (r *CountingReader) Reset() {
 	clear(r.distinct)
 }
 
-func (r *CountingReader) CheckRelationships(
-	ctx context.Context,
-	resourceType ObjectType,
-	resourceID string,
-	resourceRelation string,
-	subject ObjectAndRelation,
-	withCaveats, withExpiration bool,
-) (PathSeq, error) {
-	r.record("check", resourceType.Type, resourceID, resourceRelation, subject.String())
-	return r.inner.CheckRelationships(ctx, resourceType, resourceID, resourceRelation, subject, withCaveats, withExpiration)
+func (r *CountingReader) CheckRelationships(ctx context.Context, filter CheckFilter) (PathSeq, error) {
+	r.record("check", filter.ResourceType, strings.Join(filter.ResourceIDs, ","), filter.ResourceRelation,
+		filter.SubjectType, strings.Join(filter.SubjectIDs, ","), filter.SubjectRelation)
+	return r.inner.CheckRelationships(ctx, filter)
 }
 
 func (r *CountingReader) QuerySubjects(

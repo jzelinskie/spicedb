@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/tuple"
 )
 
 // stubReader is a QueryDatastoreReader that returns empty results, used to
@@ -18,7 +19,7 @@ type stubReader struct {
 	calls atomic.Int64
 }
 
-func (s *stubReader) CheckRelationships(_ context.Context, _ ObjectType, _ string, _ string, _ ObjectAndRelation, _, _ bool) (PathSeq, error) {
+func (s *stubReader) CheckRelationships(_ context.Context, _ CheckFilter) (PathSeq, error) {
 	s.calls.Add(1)
 	return EmptyPathSeq(), nil
 }
@@ -49,13 +50,24 @@ func TestCountingReader(t *testing.T) {
 	doc2 := NewObject("document", "doc2")
 	alice := NewObject("user", "alice").WithEllipses()
 
+	checkDoc := func(id string) CheckFilter {
+		return CheckFilter{
+			ResourceType:     "document",
+			ResourceIDs:      []string{id},
+			ResourceRelation: "viewer",
+			SubjectType:      "user",
+			SubjectIDs:       []string{"alice"},
+			SubjectRelation:  tuple.Ellipsis,
+		}
+	}
+
 	t.Run("counts every call and delegates", func(t *testing.T) {
 		require := require.New(t)
 		inner := &stubReader{}
 		r := NewCountingReader(inner)
 		ctx := t.Context()
 
-		_, err := r.CheckRelationships(ctx, docType, "doc1", "viewer", alice, false, false)
+		_, err := r.CheckRelationships(ctx, checkDoc("doc1"))
 		require.NoError(err)
 		_, err = r.QuerySubjects(ctx, doc1, "viewer", docType, false, false, QueryPage{})
 		require.NoError(err)
@@ -76,10 +88,10 @@ func TestCountingReader(t *testing.T) {
 
 		// The same query three times, then a different resource.
 		for range 3 {
-			_, err := r.CheckRelationships(ctx, docType, "doc1", "viewer", alice, false, false)
+			_, err := r.CheckRelationships(ctx, checkDoc("doc1"))
 			require.NoError(err)
 		}
-		_, err := r.CheckRelationships(ctx, docType, "doc2", "viewer", alice, false, false)
+		_, err := r.CheckRelationships(ctx, checkDoc("doc2"))
 		require.NoError(err)
 
 		require.Equal(4, r.Queries())
@@ -93,7 +105,7 @@ func TestCountingReader(t *testing.T) {
 
 		// Same resource and relation, but three different operations: each is
 		// a distinct datastore query and must not collide in the key space.
-		_, err := r.CheckRelationships(ctx, docType, "doc1", "viewer", alice, false, false)
+		_, err := r.CheckRelationships(ctx, checkDoc("doc1"))
 		require.NoError(err)
 		_, err = r.QuerySubjects(ctx, doc1, "viewer", docType, false, false, QueryPage{})
 		require.NoError(err)
@@ -121,7 +133,7 @@ func TestCountingReader(t *testing.T) {
 		r := NewCountingReader(&stubReader{})
 		ctx := t.Context()
 
-		_, err := r.CheckRelationships(ctx, docType, "doc1", "viewer", alice, false, false)
+		_, err := r.CheckRelationships(ctx, checkDoc("doc1"))
 		require.NoError(err)
 		require.Equal(1, r.Queries())
 
@@ -130,7 +142,7 @@ func TestCountingReader(t *testing.T) {
 		require.Equal(0, r.DistinctQueries())
 
 		// The key space is cleared too, so a repeat after Reset counts as distinct.
-		_, err = r.CheckRelationships(ctx, docType, "doc1", "viewer", alice, false, false)
+		_, err = r.CheckRelationships(ctx, checkDoc("doc1"))
 		require.NoError(err)
 		require.Equal(1, r.Queries())
 		require.Equal(1, r.DistinctQueries())

@@ -71,19 +71,41 @@ func (r *DatastoreIterator) CheckImpl(ctx *Context, resource Object, subject Obj
 	return r.checkNormalImpl(ctx, resource, subject)
 }
 
+// checkFilter builds the datastore filter for a check over the given resource
+// and subject IDs. Both axes are plural: a scalar check passes one ID on each
+// side, a batched check passes the whole set so it costs one query rather than
+// one per element.
+func (r *DatastoreIterator) checkFilter(resourceIDs []string, subjectType string, subjectIDs []string, subjectRelation string) CheckFilter {
+	return CheckFilter{
+		ResourceType:     r.base.DefinitionName(),
+		ResourceIDs:      resourceIDs,
+		ResourceRelation: r.base.RelationName(),
+		SubjectType:      subjectType,
+		SubjectIDs:       subjectIDs,
+		SubjectRelation:  subjectRelation,
+		WithCaveats:      r.base.Caveat() != "",
+		WithExpiration:   r.base.Expiration(),
+	}
+}
+
+// subjectTypeAllowed mirrors the type gate in CheckImpl: a subject whose type
+// does not match the base relation's type is rejected without a query, unless
+// the base relation carries a concrete subrelation, which may legitimately
+// bridge to a different type.
+func (r *DatastoreIterator) subjectTypeAllowed(subjectType string) bool {
+	if subjectType == r.base.Type() {
+		return true
+	}
+	return r.base.Subrelation() != "" && r.base.Subrelation() != tuple.Ellipsis && !r.base.Wildcard()
+}
+
 func (r *DatastoreIterator) checkNormalImpl(ctx *Context, resource Object, subject ObjectAndRelation) (*Path, error) {
 	if ctx.shouldTrace() {
 		ctx.TraceStep(r, "querying datastore for %s:%s with resource=%s:%s", r.base.Type(), r.base.RelationName(), resource.ObjectType, resource.ObjectID)
 	}
 
-	resourceType := ObjectType{Type: r.base.DefinitionName()}
 	pathSeq, err := ctx.Reader.CheckRelationships(ctx,
-		resourceType,
-		resource.ObjectID,
-		r.base.RelationName(),
-		subject,
-		r.base.Caveat() != "", r.base.Expiration(),
-	)
+		r.checkFilter([]string{resource.ObjectID}, subject.ObjectType, []string{subject.ObjectID}, subject.Relation))
 	if err != nil {
 		return nil, err
 	}
@@ -116,14 +138,8 @@ func (r *DatastoreIterator) checkWildcardImpl(ctx *Context, resource Object, sub
 		Relation:   tuple.Ellipsis,
 	}
 
-	resourceType := ObjectType{Type: r.base.DefinitionName()}
 	pathSeq, err := ctx.Reader.CheckRelationships(ctx,
-		resourceType,
-		resource.ObjectID,
-		r.base.RelationName(),
-		wildcardSubject,
-		r.base.Caveat() != "", r.base.Expiration(),
-	)
+		r.checkFilter([]string{resource.ObjectID}, wildcardSubject.ObjectType, []string{wildcardSubject.ObjectID}, wildcardSubject.Relation))
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +154,139 @@ func (r *DatastoreIterator) checkWildcardImpl(ctx *Context, resource Object, sub
 		return nil, nil
 	}
 	return paths[0], nil
+}
+
+// CheckManySubjectsImpl answers a batch of subjects against one resource with a
+// single datastore query, by putting every subject ID into the filter instead
+// of issuing one query per subject.
+//
+// Subjects are grouped by (type, relation) because those two fields go into the
+// query filter rather than the ID list; in practice a batch arriving from an
+// arrow is homogeneous and forms a single group. Subjects whose type the base
+// relation cannot accept are left nil without a query, matching CheckImpl.
+func (r *DatastoreIterator) CheckManySubjectsImpl(ctx *Context, resource Object, subjects []ObjectAndRelation) ([]*Path, error) {
+	out := make([]*Path, len(subjects))
+
+	// Wildcard checks rewrite the subject per element, so they stay on the
+	// scalar path.
+	if r.base.Wildcard() {
+		for i, subject := range subjects {
+			path, err := r.CheckImpl(ctx, resource, subject)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = path
+		}
+		return out, nil
+	}
+
+	type subjectGroup struct{ objectType, relation string }
+	groups := make(map[subjectGroup][]int, 1)
+	for i, subject := range subjects {
+		if !r.subjectTypeAllowed(subject.ObjectType) {
+			continue
+		}
+		key := subjectGroup{subject.ObjectType, subject.Relation}
+		groups[key] = append(groups[key], i)
+	}
+
+	for key, indexes := range groups {
+		ids := make([]string, 0, len(indexes))
+		seen := make(map[string]struct{}, len(indexes))
+		for _, i := range indexes {
+			if _, ok := seen[subjects[i].ObjectID]; ok {
+				continue
+			}
+			seen[subjects[i].ObjectID] = struct{}{}
+			ids = append(ids, subjects[i].ObjectID)
+		}
+
+		if ctx.shouldTrace() {
+			ctx.TraceStep(r, "batched datastore check for %s:%s with resource=%s:%s and %d subjects",
+				r.base.Type(), r.base.RelationName(), resource.ObjectType, resource.ObjectID, len(ids))
+		}
+
+		pathSeq, err := ctx.Reader.CheckRelationships(ctx,
+			r.checkFilter([]string{resource.ObjectID}, key.objectType, ids, key.relation))
+		if err != nil {
+			return nil, err
+		}
+		paths, err := CollectAll(pathSeq)
+		if err != nil {
+			return nil, err
+		}
+
+		bySubject := make(map[ObjectAndRelation]*Path, len(paths))
+		for _, path := range paths {
+			bySubject[path.Subject] = path
+		}
+		for _, i := range indexes {
+			out[i] = bySubject[subjects[i]]
+		}
+	}
+
+	return out, nil
+}
+
+// CheckManyResourcesImpl answers a batch of resources against one subject with
+// a single datastore query, the resource-axis counterpart of
+// CheckManySubjectsImpl.
+func (r *DatastoreIterator) CheckManyResourcesImpl(ctx *Context, resources []Object, subject ObjectAndRelation) ([]*Path, error) {
+	out := make([]*Path, len(resources))
+
+	// Wildcard checks rewrite the subject per element, so they stay on the
+	// scalar path.
+	if r.base.Wildcard() {
+		for i, resource := range resources {
+			path, err := r.CheckImpl(ctx, resource, subject)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = path
+		}
+		return out, nil
+	}
+
+	// One subject for the whole batch: if its type is not acceptable, no
+	// resource can match and no query is needed.
+	if !r.subjectTypeAllowed(subject.ObjectType) {
+		return out, nil
+	}
+
+	ids := make([]string, 0, len(resources))
+	seen := make(map[string]struct{}, len(resources))
+	for _, resource := range resources {
+		if _, ok := seen[resource.ObjectID]; ok {
+			continue
+		}
+		seen[resource.ObjectID] = struct{}{}
+		ids = append(ids, resource.ObjectID)
+	}
+
+	if ctx.shouldTrace() {
+		ctx.TraceStep(r, "batched datastore check for %s:%s with %d resources and subject=%s:%s",
+			r.base.Type(), r.base.RelationName(), len(ids), subject.ObjectType, subject.ObjectID)
+	}
+
+	pathSeq, err := ctx.Reader.CheckRelationships(ctx,
+		r.checkFilter(ids, subject.ObjectType, []string{subject.ObjectID}, subject.Relation))
+	if err != nil {
+		return nil, err
+	}
+	paths, err := CollectAll(pathSeq)
+	if err != nil {
+		return nil, err
+	}
+
+	byResource := make(map[Object]*Path, len(paths))
+	for _, path := range paths {
+		byResource[path.Resource] = path
+	}
+	for i, resource := range resources {
+		out[i] = byResource[resource]
+	}
+
+	return out, nil
 }
 
 func (r *DatastoreIterator) IterSubjectsImpl(ctx *Context, resource Object, filterSubjectType ObjectType) (PathSeq, error) {
@@ -237,14 +386,8 @@ func (r *DatastoreIterator) iterSubjectsWildcardImpl(ctx *Context, resource Obje
 		Relation:   r.base.Subrelation(),
 	}
 
-	resourceType := ObjectType{Type: r.base.DefinitionName()}
 	return ctx.Reader.CheckRelationships(ctx,
-		resourceType,
-		resource.ObjectID,
-		r.base.RelationName(),
-		wildcardSubject,
-		r.base.Caveat() != "", r.base.Expiration(),
-	)
+		r.checkFilter([]string{resource.ObjectID}, wildcardSubject.ObjectType, []string{wildcardSubject.ObjectID}, wildcardSubject.Relation))
 }
 
 func (r *DatastoreIterator) IterResourcesImpl(ctx *Context, subject ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {

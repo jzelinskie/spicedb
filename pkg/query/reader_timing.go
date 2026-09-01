@@ -30,18 +30,11 @@ func (r *delayReader) sleep(ctx context.Context) error {
 	}
 }
 
-func (r *delayReader) CheckRelationships(
-	ctx context.Context,
-	resourceType ObjectType,
-	resourceID string,
-	resourceRelation string,
-	subject ObjectAndRelation,
-	withCaveats, withExpiration bool,
-) (PathSeq, error) {
+func (r *delayReader) CheckRelationships(ctx context.Context, filter CheckFilter) (PathSeq, error) {
 	if err := r.sleep(ctx); err != nil {
 		return nil, err
 	}
-	return r.inner.CheckRelationships(ctx, resourceType, resourceID, resourceRelation, subject, withCaveats, withExpiration)
+	return r.inner.CheckRelationships(ctx, filter)
 }
 
 func (r *delayReader) QuerySubjects(

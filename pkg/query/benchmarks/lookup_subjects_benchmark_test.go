@@ -115,6 +115,15 @@ func BenchmarkLookupSubjects(b *testing.B) {
 					require.NoError(b, err)
 					require.Len(b, results, len(lsQuery.ExpectedSubjectIDs))
 				}
+				b.StopTimer()
+
+				reportRoundTrips(b, qReader, func(r query.QueryDatastoreReader) {
+					opts := append([]query.ContextOption{query.WithReader(r)}, ctxOpts...)
+					paths, err := query.NewLocalContext(ctx, opts...).IterSubjects(advisedIt, resource, filterSubjectType)
+					require.NoError(b, err)
+					_, err = query.CollectAll(paths)
+					require.NoError(b, err)
+				})
 			})
 
 			if *includeDelay {

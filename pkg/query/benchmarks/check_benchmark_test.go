@@ -125,6 +125,14 @@ func BenchmarkCheck(b *testing.B) {
 					require.NoError(b, err)
 					require.NotNil(b, path)
 				}
+				b.StopTimer()
+
+				reportRoundTrips(b, qReader, func(r query.QueryDatastoreReader) {
+					opts := append([]query.ContextOption{query.WithReader(r)}, ctxOpts...)
+					path, err := query.NewLocalContext(ctx, opts...).Check(advisedIt, resource, subject)
+					require.NoError(b, err)
+					require.NotNil(b, path)
+				})
 			})
 
 			if *includeClassic {

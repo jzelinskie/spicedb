@@ -45,8 +45,11 @@ func runClassicCheck(
 
 	// The dispatcher reads schema and relationships via the datalayer pulled
 	// off the context, so we install one. ContextWithDataLayer adds both the
-	// boxed handle and the value in a single call.
-	dispatchCtx := datalayer.ContextWithDataLayer(ctx, datalayer.NewDataLayer(ds))
+	// boxed handle and the value in a single call. The datastore is wrapped so
+	// the classic path's round-trips are counted at the same layer as the query
+	// planner's, making the two directly comparable.
+	counter := newDatastoreCounter()
+	dispatchCtx := datalayer.ContextWithDataLayer(ctx, datalayer.NewDataLayer(countingDatastore{ds, counter}))
 
 	resourceRR := &core.RelationReference{
 		Namespace: check.ResourceType,
@@ -90,6 +93,18 @@ func runClassicCheck(
 		require.NoError(b, err)
 		requireMember(b, resp, check.ResourceID)
 	}
+	b.StopTimer()
+
+	// One more untimed dispatch, counted, so the classic variant reports the
+	// same round-trip metrics as the query-planner variants.
+	counter.reset()
+	resp, err = dispatcher.DispatchCheck(dispatchCtx, newReq())
+	require.NoError(b, err)
+	requireMember(b, resp, check.ResourceID)
+
+	queries, distinct := counter.stats()
+	b.ReportMetric(float64(queries), queriesMetric)
+	b.ReportMetric(float64(distinct), distinctMetric)
 }
 
 func requireMember(b *testing.B, resp *v1.DispatchCheckResponse, resourceID string) {

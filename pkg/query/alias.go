@@ -391,6 +391,42 @@ func typeAllowsSelfEdge(resourceTypes []ObjectType, subjectType string) bool {
 // a subject anywhere in the datastore (expired or not), and the filter allows it, we
 // include a self-edge in the results.
 func (a *AliasIterator) shouldIncludeSelfEdge(ctx *Context, resource Object, filterSubjectType ObjectType) bool {
+	// TODO: this early return makes Check miss the identity whenever it has to
+	// be discovered *through* the tree rather than at the top of it, which is a
+	// wrong answer today:
+	//
+	//	definition folder {
+	//	  relation parent: folder
+	//	  relation viewer: user | folder#view
+	//	  permission view = viewer + owner + parent->view
+	//	}
+	//	folder:strategy#parent@folder:company
+	//
+	//	Check(folder:strategy#view <- folder:company#view)
+	//	  classic  = MEMBER      (company#view satisfies company#view by identity,
+	//	                          and strategy's view includes parent->view)
+	//	  planner  = no path
+	//
+	// Check normally decides identity locally in resolveCheckPath by comparing
+	// the resource to the subject, and that works when the subject is the
+	// resource being checked — Check(folder:company#view <- folder:company#view)
+	// is correct today. But `view` is recursive through parent->view, so the
+	// Check resolves via RecursiveIterator.recursiveCheckIterSubjects, which
+	// answers by running the IterSubjects machinery underneath. Every alias in
+	// that traversal hits this early return, because the operation that started
+	// it was a Check, and company's identity is exactly what gets dropped.
+	//
+	// Relaxing the gate is not enough on its own. Check's identity cannot key
+	// off a request-wide target the way IterSubjects' does, because an arrow
+	// genuinely changes the subject mid-traversal: checkRightToLeft passes each
+	// intermediate as the subject. The decision has to come from the filter
+	// recursiveCheckIterSubjects passes down, and that filter deliberately drops
+	// the subrelation ("ellipsis is not a real relation"), so widening it also
+	// widens what FilterSubjectsByType admits and can drop results elsewhere.
+	//
+	// Worth fixing against the classic dispatcher as ground truth rather than by
+	// inspection; internal/graph/lookupsubjects.go and check.go decide identity
+	// with pure comparisons and can be queried directly for expected values.
 	if ctx.TopLevelOperation != OperationIterSubjects {
 		return false
 	}

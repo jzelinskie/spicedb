@@ -33,20 +33,17 @@ type CountingReader struct {
 	distinct map[string]bool // GUARDED_BY(mu)
 }
 
-// ReaderCounts breaks the query total down by operation. The distinction
-// matters because the operations have different batching stories: enumeration
-// and checks collapse a fan-out into one query where the plan supports it,
-// while an existence probe is still issued one subject at a time.
+// ReaderCounts breaks the query total down by operation, so a test can assert
+// on the queries a change is about without being perturbed by the others.
 type ReaderCounts struct {
-	Checks          int
-	Subjects        int
-	Resources       int
-	ExistenceProbes int
+	Checks    int
+	Subjects  int
+	Resources int
 }
 
 // Total returns the sum of all counted operations, equal to Queries().
 func (c ReaderCounts) Total() int {
-	return c.Checks + c.Subjects + c.Resources + c.ExistenceProbes
+	return c.Checks + c.Subjects + c.Resources
 }
 
 var _ QueryDatastoreReader = &CountingReader{}
@@ -115,15 +112,6 @@ func (r *CountingReader) QueryResources(ctx context.Context, filter ResourcesFil
 	r.record(func(c *ReaderCounts) { c.Resources++ }, "resources", filter.ResourceType, filter.ResourceRelation,
 		filter.SubjectType, strings.Join(filter.SubjectIDs, ","), filter.SubjectRelation)
 	return r.inner.QueryResources(ctx, filter)
-}
-
-func (r *CountingReader) SubjectExistsAsRelationship(
-	ctx context.Context,
-	subject Object,
-	nonEllipsisRelation string,
-) (bool, error) {
-	r.record(func(c *ReaderCounts) { c.ExistenceProbes++ }, "exists", subject.ObjectType, subject.ObjectID, nonEllipsisRelation)
-	return r.inner.SubjectExistsAsRelationship(ctx, subject, nonEllipsisRelation)
 }
 
 // LookupCaveatDefinition is not counted: implementations are expected to cache

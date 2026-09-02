@@ -34,19 +34,12 @@ func (s *stubReader) QueryResources(_ context.Context, _ ResourcesFilter) (PathS
 	return EmptyPathSeq(), nil
 }
 
-func (s *stubReader) SubjectExistsAsRelationship(_ context.Context, _ Object, _ string) (bool, error) {
-	s.calls.Add(1)
-	return false, nil
-}
-
 func (s *stubReader) LookupCaveatDefinition(_ context.Context, _ string) (datastore.CaveatDefinition, error) {
 	s.calls.Add(1)
 	return nil, nil
 }
 
 func TestCountingReader(t *testing.T) {
-	doc1 := NewObject("document", "doc1")
-
 	subjectsOf := func(resourceID string) SubjectsFilter {
 		return SubjectsFilter{
 			ResourceType:     "document",
@@ -89,12 +82,9 @@ func TestCountingReader(t *testing.T) {
 		require.NoError(err)
 		_, err = r.QueryResources(ctx, resourcesOf("alice"))
 		require.NoError(err)
-		_, err = r.SubjectExistsAsRelationship(ctx, doc1, "viewer")
-		require.NoError(err)
-
-		require.Equal(4, r.Queries())
-		require.Equal(4, r.DistinctQueries())
-		require.Equal(4, int(inner.calls.Load()), "every counted call must reach the inner reader")
+		require.Equal(3, r.Queries())
+		require.Equal(3, r.DistinctQueries())
+		require.Equal(3, int(inner.calls.Load()), "every counted call must reach the inner reader")
 	})
 
 	t.Run("distinguishes repeats from distinct calls", func(t *testing.T) {

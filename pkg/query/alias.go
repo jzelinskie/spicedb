@@ -261,7 +261,7 @@ func (a *AliasIterator) IterSubjectsImpl(ctx *Context, resource Object, filterSu
 	// in internal/graph/check.go): if the resource (with relation) matches the subject
 	// exactly, it returns MEMBER. This only applies if the resource actually appears
 	// as a subject in the data and the filter allows it.
-	shouldAddSelfEdge := a.shouldIncludeSelfEdge(ctx, resource, filterSubjectType)
+	shouldAddSelfEdge := a.shouldIncludeSelfEdge(ctx, resource)
 
 	return a.maybePrependSelfEdge(resource, subSeq, shouldAddSelfEdge), nil
 }
@@ -282,7 +282,7 @@ func (a *AliasIterator) IterSubjectsForResourcesImpl(ctx *Context, resources []O
 	rel := a.effectiveRelation()
 	selfEdges := make([]*Path, 0, len(resources))
 	for _, resource := range resources {
-		if !a.shouldIncludeSelfEdge(ctx, resource, filterSubjectType) {
+		if !a.shouldIncludeSelfEdge(ctx, resource) {
 			continue
 		}
 		selfEdges = append(selfEdges, &Path{
@@ -386,72 +386,33 @@ func typeAllowsSelfEdge(resourceTypes []ObjectType, subjectType string) bool {
 	return false
 }
 
-// shouldIncludeSelfEdge checks if a self-edge should be included for the given resource.
-// This matches the dispatcher's identity check behavior: if resource#relation appears as
-// a subject anywhere in the datastore (expired or not), and the filter allows it, we
-// include a self-edge in the results.
-func (a *AliasIterator) shouldIncludeSelfEdge(ctx *Context, resource Object, filterSubjectType ObjectType) bool {
-	// TODO: this early return makes Check miss the identity whenever it has to
-	// be discovered *through* the tree rather than at the top of it, which is a
-	// wrong answer today:
-	//
-	//	definition folder {
-	//	  relation parent: folder
-	//	  relation viewer: user | folder#view
-	//	  permission view = viewer + owner + parent->view
-	//	}
-	//	folder:strategy#parent@folder:company
-	//
-	//	Check(folder:strategy#view <- folder:company#view)
-	//	  classic  = MEMBER      (company#view satisfies company#view by identity,
-	//	                          and strategy's view includes parent->view)
-	//	  planner  = no path
-	//
-	// Check normally decides identity locally in resolveCheckPath by comparing
-	// the resource to the subject, and that works when the subject is the
-	// resource being checked — Check(folder:company#view <- folder:company#view)
-	// is correct today. But `view` is recursive through parent->view, so the
-	// Check resolves via RecursiveIterator.recursiveCheckIterSubjects, which
-	// answers by running the IterSubjects machinery underneath. Every alias in
-	// that traversal hits this early return, because the operation that started
-	// it was a Check, and company's identity is exactly what gets dropped.
-	//
-	// Relaxing the gate is not enough on its own. Check's identity cannot key
-	// off a request-wide target the way IterSubjects' does, because an arrow
-	// genuinely changes the subject mid-traversal: checkRightToLeft passes each
-	// intermediate as the subject. The decision has to come from the filter
-	// recursiveCheckIterSubjects passes down, and that filter deliberately drops
-	// the subrelation ("ellipsis is not a real relation"), so widening it also
-	// widens what FilterSubjectsByType admits and can drop results elsewhere.
-	//
-	// Worth fixing against the classic dispatcher as ground truth rather than by
-	// inspection; internal/graph/lookupsubjects.go and check.go decide identity
-	// with pure comparisons and can be queried directly for expected values.
+// shouldIncludeSelfEdge reports whether the reflexive identity subject applies:
+// enumerating the subjects of group:a#member includes group:a#member itself.
+//
+// This is a comparison, not a lookup. It holds exactly when the request asked
+// for subjects of this alias's own (definition, relation) — the same condition
+// the classic dispatcher tests at internal/graph/lookupsubjects.go, comparing
+// req.SubjectRelation against req.ResourceRelation, without touching the
+// datastore.
+//
+// The comparison is against Context.TargetSubjectType rather than the caller's
+// filterSubjectType, because arrows and recursion pass no filter (they must walk
+// intermediate-typed results to keep traversing) and an empty filter would make
+// the test vacuously true for every object they visit.
+//
+// Note the decision is per node, not per traversal: in `active = member -
+// banned` with a target of group#member, it holds for the `member` branch and
+// not for the `banned` branch, and that asymmetry is what makes the exclusion
+// come out right.
+func (a *AliasIterator) shouldIncludeSelfEdge(ctx *Context, resource Object) bool {
 	if ctx.TopLevelOperation != OperationIterSubjects {
 		return false
 	}
-	rel := a.effectiveRelation()
-	typeMatches := filterSubjectType.Type == "" || filterSubjectType.Type == resource.ObjectType
-	relationMatches := filterSubjectType.Subrelation == "" || filterSubjectType.Subrelation == rel
-	if !typeMatches || !relationMatches || ctx.Reader == nil {
+	target := ctx.TargetSubjectType
+	if target.Type != a.definitionName || target.Type != resource.ObjectType {
 		return false
 	}
-
-	// Second check: does the resource actually appear as a subject in the data?
-	// We check for ANY relationships (expired or not) because the dispatcher's
-	// identity check applies regardless of expiration.
-	exists, err := a.resourceExistsAsSubject(ctx, resource)
-	if err != nil {
-		// On error, conservatively return false rather than failing the entire operation
-		return false
-	}
-	return exists
-}
-
-// resourceExistsAsSubject queries the datastore to check if the given resource appears
-// as a subject in any relationship, including expired relationships.
-func (a *AliasIterator) resourceExistsAsSubject(ctx *Context, resource Object) (bool, error) {
-	return ctx.Reader.SubjectExistsAsRelationship(ctx, resource, a.effectiveRelation())
+	return target.Subrelation == a.effectiveRelation()
 }
 
 func (a *AliasIterator) IterResourcesImpl(ctx *Context, subject ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {

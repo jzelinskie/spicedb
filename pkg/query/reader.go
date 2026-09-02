@@ -14,10 +14,6 @@ import (
 // WildcardObjectID is the subject ID representing a public wildcard ("*").
 const WildcardObjectID = tuple.PublicWildcard
 
-// limitOne is used for existence-probe queries that only need to know if
-// at least one row exists.
-var limitOne uint64 = 1
-
 // CheckFilter selects the relationships a check needs: those connecting any of
 // ResourceIDs to any of SubjectIDs, under a fixed relation on each side.
 //
@@ -90,15 +86,6 @@ type QueryDatastoreReader interface {
 
 	// QueryResources finds all resource paths for the filter's subjects.
 	QueryResources(ctx context.Context, filter ResourcesFilter) (PathSeq, error)
-
-	// SubjectExistsAsRelationship is an existence probe used by AliasIterator.
-	// It includes expired relationships and returns true if any relationship
-	// has the given subject with the specified non-ellipsis relation.
-	SubjectExistsAsRelationship(
-		ctx context.Context,
-		subject Object,
-		nonEllipsisRelation string,
-	) (bool, error)
 
 	// LookupCaveatDefinition fetches a single caveat definition by name.
 	// Implementations are expected to cache results.
@@ -255,44 +242,6 @@ func (r *datalayerQueryDatastoreReader) QueryResources(ctx context.Context, reso
 		return nil, err
 	}
 	return convertRelationSeqToPathSeq(iter.Seq2[tuple.Relationship, error](relIter)), nil
-}
-
-func (r *datalayerQueryDatastoreReader) SubjectExistsAsRelationship(
-	ctx context.Context,
-	subject Object,
-	nonEllipsisRelation string,
-) (bool, error) {
-	filter := datastore.RelationshipsFilter{
-		OptionalSubjectsSelectors: []datastore.SubjectsSelector{
-			{
-				OptionalSubjectType: subject.ObjectType,
-				OptionalSubjectIds:  []string{subject.ObjectID},
-				RelationFilter:      datastore.SubjectRelationFilter{}.WithNonEllipsisRelation(nonEllipsisRelation),
-			},
-		},
-		OptionalExpirationOption: datastore.ExpirationFilterOptionNone,
-	}
-
-	// The filter constrains subject type, subject ID and subject relation with
-	// no resource constraint at all, which matches none of the specific query
-	// shapes; Varying lets the datastore pick an index from the columns actually
-	// filtered rather than forcing one that does not fit.
-	relIter, err := r.inner.QueryRelationships(ctx, filter,
-		options.WithLimit(&limitOne),
-		options.WithSkipExpiration(true),
-		options.WithQueryShape(queryshape.Varying),
-	)
-	if err != nil {
-		return false, err
-	}
-
-	for _, err := range relIter {
-		if err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	return false, nil
 }
 
 func (r *datalayerQueryDatastoreReader) LookupCaveatDefinition(

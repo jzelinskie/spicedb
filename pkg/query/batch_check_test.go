@@ -129,11 +129,8 @@ func documentsWithViewers(n int) ([]tuple.Relationship, []Object, []ObjectAndRel
 // invariant for the iteration axis: enumerating subjects for many resources
 // must cost the same number of enumeration queries as enumerating for one.
 //
-// The assertion is on ReaderCounts.Subjects rather than the total because the
-// alias self-edge probe is a separate, still-unbatched query — one existence
-// probe per resource per alias level. That is asserted explicitly below so the
-// remaining gap is recorded rather than hidden; when the probe is batched or
-// decided statically from the schema, this test should tighten to the total.
+// The assertion covers every datastore query, not just the enumerations: no
+// operation in this path may scale with the width of the batch.
 func TestIterSubjectsForResourcesDoesNotScaleWithResourceCount(t *testing.T) {
 	require := require.New(t)
 
@@ -153,13 +150,8 @@ func TestIterSubjectsForResourcesDoesNotScaleWithResourceCount(t *testing.T) {
 	many, paths := countsFor(8)
 
 	require.Equal(1, one.Subjects, "one resource takes one enumeration query")
-	require.Equal(one.Subjects, many.Subjects,
-		"a batch of 8 resources must take the same number of enumeration queries as a batch of 1")
-
-	// Not yet batched: the alias self-edge probe is still one query per resource
-	// per alias level. Recorded so a change in either direction is visible.
-	require.Equal(8*one.ExistenceProbes, many.ExistenceProbes,
-		"self-edge probes still scale with the batch; see AliasIterator.shouldIncludeSelfEdge")
+	require.Equal(one, many,
+		"a batch of 8 resources must take the same queries as a batch of 1")
 
 	subjectsByResource := map[string]string{}
 	for _, path := range paths {

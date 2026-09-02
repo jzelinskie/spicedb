@@ -202,6 +202,52 @@ func (e *DispatchExecutor) IterResources(ctx *query.Context, it query.Iterator, 
 	return query.FilterResourcesByType(pathSeq, filterResourceType), nil
 }
 
+// IterSubjectsForResources enumerates the subjects of every resource in one
+// call. There is no batched form on the wire yet — DispatchQueryPlanRequest
+// carries a single resource for LOOKUP_SUBJECTS — so a subtree that dispatches
+// is walked one resource at a time, while a local subtree gets the batched path.
+func (e *DispatchExecutor) IterSubjectsForResources(ctx *query.Context, it query.Iterator, resources []query.Object, filterSubjectType query.ObjectType) (query.PathSeq, error) {
+	if _, ok := e.shouldDispatch(it); ok {
+		return func(yield func(*query.Path, error) bool) {
+			for _, resource := range resources {
+				pathSeq, err := e.dispatchIterSubjects(ctx, it, resource, filterSubjectType)
+				if err != nil {
+					yield(nil, err)
+					return
+				}
+				for path, err := range pathSeq {
+					if !yield(path, err) {
+						return
+					}
+				}
+			}
+		}, nil
+	}
+	return query.IterSubjectsForResourcesOn(ctx, it, resources, filterSubjectType)
+}
+
+// IterResourcesForSubjects is the subject-axis counterpart of
+// IterSubjectsForResources, with the same per-element fallback across the wire.
+func (e *DispatchExecutor) IterResourcesForSubjects(ctx *query.Context, it query.Iterator, subjects []query.ObjectAndRelation, filterResourceType query.ObjectType) (query.PathSeq, error) {
+	if _, ok := e.shouldDispatch(it); ok {
+		return func(yield func(*query.Path, error) bool) {
+			for _, subject := range subjects {
+				pathSeq, err := e.dispatchIterResources(ctx, it, subject, filterResourceType)
+				if err != nil {
+					yield(nil, err)
+					return
+				}
+				for path, err := range pathSeq {
+					if !yield(path, err) {
+						return
+					}
+				}
+			}
+		}, nil
+	}
+	return query.IterResourcesForSubjectsOn(ctx, it, subjects, filterResourceType)
+}
+
 func (e *DispatchExecutor) dispatchCheck(ctx *query.Context, it query.Iterator, resource query.Object, subject query.ObjectAndRelation) (*query.Path, error) {
 	subCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

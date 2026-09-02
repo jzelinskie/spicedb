@@ -289,28 +289,88 @@ func (r *DatastoreIterator) CheckManyResourcesImpl(ctx *Context, resources []Obj
 	return out, nil
 }
 
+// objectIDs collects the IDs of the given objects, skipping empties and
+// duplicates. An empty result means "no resource ID constraint", which is how
+// wildcard expansion asks for every resource of the type.
+func objectIDs(objects []Object) []string {
+	ids := make([]string, 0, len(objects))
+	seen := make(map[string]struct{}, len(objects))
+	for _, object := range objects {
+		if object.ObjectID == "" {
+			continue
+		}
+		if _, ok := seen[object.ObjectID]; ok {
+			continue
+		}
+		seen[object.ObjectID] = struct{}{}
+		ids = append(ids, object.ObjectID)
+	}
+	return ids
+}
+
+// subjectsFilter builds the datastore filter for enumerating subjects of the
+// given resources. resourceIDs is plural so a batch of starting points costs one
+// query; an empty slice applies no resource ID constraint.
+func (r *DatastoreIterator) subjectsFilter(resourceType string, resourceIDs []string, page QueryPage) SubjectsFilter {
+	return SubjectsFilter{
+		ResourceType:     resourceType,
+		ResourceIDs:      resourceIDs,
+		ResourceRelation: r.base.RelationName(),
+		SubjectType:      r.base.Type(),
+		SubjectRelation:  r.base.Subrelation(),
+		WithCaveats:      r.base.Caveat() != "",
+		WithExpiration:   r.base.Expiration(),
+		Page:             page,
+	}
+}
+
+// resourcesFilter builds the datastore filter for enumerating resources of the
+// given subjects. subjectIDs is plural for the same reason.
+func (r *DatastoreIterator) resourcesFilter(subjectType string, subjectIDs []string, subjectRelation string, page QueryPage) ResourcesFilter {
+	return ResourcesFilter{
+		ResourceType:     r.base.DefinitionName(),
+		ResourceRelation: r.base.RelationName(),
+		SubjectType:      subjectType,
+		SubjectIDs:       subjectIDs,
+		SubjectRelation:  subjectRelation,
+		WithCaveats:      r.base.Caveat() != "",
+		WithExpiration:   r.base.Expiration(),
+		Page:             page,
+	}
+}
+
 func (r *DatastoreIterator) IterSubjectsImpl(ctx *Context, resource Object, filterSubjectType ObjectType) (PathSeq, error) {
 	if r.base.Wildcard() {
 		return r.iterSubjectsWildcardImpl(ctx, resource)
 	}
-	return r.iterSubjectsNormalImpl(ctx, resource)
+	return r.iterSubjectsNormalImpl(ctx, resource.ObjectType, objectIDs([]Object{resource}))
 }
 
-func (r *DatastoreIterator) iterSubjectsNormalImpl(ctx *Context, resource Object) (PathSeq, error) {
-	subjectType := ObjectType{
-		Type:        r.base.Type(),
-		Subrelation: r.base.Subrelation(),
+// IterSubjectsForResourcesImpl enumerates the subjects of every resource in one
+// query by putting the whole ID set into the filter.
+//
+// Pagination keeps a single cursor per iterator, which cannot be shared across
+// a batch of starting points, so a paginated call — and a wildcard base, which
+// rewrites per resource — walks one resource at a time.
+func (r *DatastoreIterator) IterSubjectsForResourcesImpl(ctx *Context, resources []Object, filterSubjectType ObjectType) (PathSeq, error) {
+	if r.base.Wildcard() || ctx.PaginationLimit != nil {
+		return iterSubjectsPerResource(ctx, r, resources, filterSubjectType)
+	}
+	if len(resources) == 0 {
+		return EmptyPathSeq(), nil
 	}
 
+	if ctx.shouldTrace() {
+		ctx.TraceStep(r, "batched datastore subjects query for %s:%s across %d resources",
+			r.base.DefinitionName(), r.base.RelationName(), len(resources))
+	}
+	return r.iterSubjectsNormalImpl(ctx, resources[0].ObjectType, objectIDs(resources))
+}
+
+func (r *DatastoreIterator) iterSubjectsNormalImpl(ctx *Context, resourceType string, resourceIDs []string) (PathSeq, error) {
 	// If pagination is not configured, do the simple eager collection
 	if ctx.PaginationLimit == nil {
-		pathSeq, err := ctx.Reader.QuerySubjects(ctx,
-			resource,
-			r.base.RelationName(),
-			subjectType,
-			r.base.Caveat() != "", r.base.Expiration(),
-			QueryPage{},
-		)
+		pathSeq, err := ctx.Reader.QuerySubjects(ctx, r.subjectsFilter(resourceType, resourceIDs, QueryPage{}))
 		if err != nil {
 			return nil, err
 		}
@@ -330,12 +390,7 @@ func (r *DatastoreIterator) iterSubjectsNormalImpl(ctx *Context, resource Object
 
 		for {
 			pathSeq, err := ctx.Reader.QuerySubjects(ctx,
-				resource,
-				r.base.RelationName(),
-				subjectType,
-				r.base.Caveat() != "", r.base.Expiration(),
-				QueryPage{Limit: ctx.PaginationLimit, Cursor: cursor},
-			)
+				r.subjectsFilter(resourceType, resourceIDs, QueryPage{Limit: ctx.PaginationLimit, Cursor: cursor}))
 			if err != nil {
 				yield(nil, err)
 				return
@@ -390,6 +445,70 @@ func (r *DatastoreIterator) iterSubjectsWildcardImpl(ctx *Context, resource Obje
 		r.checkFilter([]string{resource.ObjectID}, wildcardSubject.ObjectType, []string{wildcardSubject.ObjectID}, wildcardSubject.Relation))
 }
 
+// IterResourcesForSubjectsImpl enumerates the resources of every subject in one
+// query by putting the whole ID set into the filter.
+//
+// As with IterSubjectsForResourcesImpl, a paginated call or a wildcard base
+// walks one subject at a time. Subjects are grouped by relation because that
+// field goes into the filter rather than the ID list, and subjects the base
+// relation cannot accept are dropped without a query.
+func (r *DatastoreIterator) IterResourcesForSubjectsImpl(ctx *Context, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
+	if r.base.Wildcard() || ctx.PaginationLimit != nil {
+		return iterResourcesPerSubject(ctx, r, subjects, filterResourceType)
+	}
+
+	byRelation := make(map[string][]string, 1)
+	relations := make([]string, 0, 1)
+	for _, subject := range subjects {
+		// Same gates as IterResourcesImpl: a mismatched type or relation cannot
+		// produce a row, so it need not reach the datastore.
+		if subject.ObjectType != r.base.Type() || subject.Relation != r.base.Subrelation() {
+			continue
+		}
+		if _, ok := byRelation[subject.Relation]; !ok {
+			relations = append(relations, subject.Relation)
+		}
+		byRelation[subject.Relation] = append(byRelation[subject.Relation], subject.ObjectID)
+	}
+	if len(relations) == 0 {
+		return EmptyPathSeq(), nil
+	}
+
+	if ctx.shouldTrace() {
+		ctx.TraceStep(r, "batched datastore resources query for %s:%s across %d subjects",
+			r.base.DefinitionName(), r.base.RelationName(), len(subjects))
+	}
+
+	return func(yield func(*Path, error) bool) {
+		for _, relation := range relations {
+			pathSeq, err := r.iterResourcesNormalImpl(ctx, r.base.Type(), dedupeStrings(byRelation[relation]), relation)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			for path, err := range pathSeq {
+				if !yield(path, err) {
+					return
+				}
+			}
+		}
+	}, nil
+}
+
+// dedupeStrings returns ids with duplicates removed, preserving order.
+func dedupeStrings(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
 func (r *DatastoreIterator) IterResourcesImpl(ctx *Context, subject ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
 	// If the types don't match, we don't even have to go to the datastore.
 	if subject.ObjectType != r.base.Type() {
@@ -414,14 +533,13 @@ func (r *DatastoreIterator) IterResourcesImpl(ctx *Context, subject ObjectAndRel
 		return EmptyPathSeq(), nil
 	}
 
+	return r.iterResourcesNormalImpl(ctx, subject.ObjectType, []string{subject.ObjectID}, subject.Relation)
+}
+
+func (r *DatastoreIterator) iterResourcesNormalImpl(ctx *Context, subjectType string, subjectIDs []string, subjectRelation string) (PathSeq, error) {
 	if ctx.PaginationLimit == nil {
 		pathSeq, err := ctx.Reader.QueryResources(ctx,
-			r.base.DefinitionName(),
-			r.base.RelationName(),
-			subject,
-			r.base.Caveat() != "", r.base.Expiration(),
-			QueryPage{},
-		)
+			r.resourcesFilter(subjectType, subjectIDs, subjectRelation, QueryPage{}))
 		if err != nil {
 			return nil, err
 		}
@@ -439,12 +557,7 @@ func (r *DatastoreIterator) IterResourcesImpl(ctx *Context, subject ObjectAndRel
 
 		for {
 			pathSeq, err := ctx.Reader.QueryResources(ctx,
-				r.base.DefinitionName(),
-				r.base.RelationName(),
-				subject,
-				r.base.Caveat() != "", r.base.Expiration(),
-				QueryPage{Limit: ctx.PaginationLimit, Cursor: cursor},
-			)
+				r.resourcesFilter(subjectType, subjectIDs, subjectRelation, QueryPage{Limit: ctx.PaginationLimit, Cursor: cursor}))
 			if err != nil {
 				yield(nil, err)
 				return
@@ -496,12 +609,7 @@ func (r *DatastoreIterator) iterResourcesWildcardImpl(ctx *Context, subject Obje
 
 	if ctx.PaginationLimit == nil {
 		pathSeq, err := ctx.Reader.QueryResources(ctx,
-			r.base.DefinitionName(),
-			r.base.RelationName(),
-			wildcardSubject,
-			r.base.Caveat() != "", r.base.Expiration(),
-			QueryPage{},
-		)
+			r.resourcesFilter(wildcardSubject.ObjectType, []string{wildcardSubject.ObjectID}, wildcardSubject.Relation, QueryPage{}))
 		if err != nil {
 			return nil, err
 		}
@@ -520,12 +628,7 @@ func (r *DatastoreIterator) iterResourcesWildcardImpl(ctx *Context, subject Obje
 
 		for {
 			pathSeq, err := ctx.Reader.QueryResources(ctx,
-				r.base.DefinitionName(),
-				r.base.RelationName(),
-				wildcardSubject,
-				r.base.Caveat() != "", r.base.Expiration(),
-				QueryPage{Limit: ctx.PaginationLimit, Cursor: cursor},
-			)
+				r.resourcesFilter(wildcardSubject.ObjectType, []string{wildcardSubject.ObjectID}, wildcardSubject.Relation, QueryPage{Limit: ctx.PaginationLimit, Cursor: cursor}))
 			if err != nil {
 				yield(nil, err)
 				return

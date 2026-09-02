@@ -29,7 +29,24 @@ type CountingReader struct {
 
 	mu       sync.Mutex
 	queries  int             // GUARDED_BY(mu)
+	counts   ReaderCounts    // GUARDED_BY(mu)
 	distinct map[string]bool // GUARDED_BY(mu)
+}
+
+// ReaderCounts breaks the query total down by operation. The distinction
+// matters because the operations have different batching stories: enumeration
+// and checks collapse a fan-out into one query where the plan supports it,
+// while an existence probe is still issued one subject at a time.
+type ReaderCounts struct {
+	Checks          int
+	Subjects        int
+	Resources       int
+	ExistenceProbes int
+}
+
+// Total returns the sum of all counted operations, equal to Queries().
+func (c ReaderCounts) Total() int {
+	return c.Checks + c.Subjects + c.Resources + c.ExistenceProbes
 }
 
 var _ QueryDatastoreReader = &CountingReader{}
@@ -39,13 +56,22 @@ func NewCountingReader(inner QueryDatastoreReader) *CountingReader {
 	return &CountingReader{inner: inner, distinct: make(map[string]bool)}
 }
 
-// record notes a single datastore round-trip against the given query key.
-func (r *CountingReader) record(parts ...string) {
+// record notes a single datastore round-trip against the given query key and
+// bumps the per-operation counter that bump points at.
+func (r *CountingReader) record(bump func(*ReaderCounts), parts ...string) {
 	key := strings.Join(parts, "|")
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.queries++
+	bump(&r.counts)
 	r.distinct[key] = true
+}
+
+// Counts returns the per-operation breakdown of the queries made so far.
+func (r *CountingReader) Counts() ReaderCounts {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counts
 }
 
 // Queries returns the total number of datastore calls made so far.
@@ -69,37 +95,26 @@ func (r *CountingReader) Reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.queries = 0
+	r.counts = ReaderCounts{}
 	clear(r.distinct)
 }
 
 func (r *CountingReader) CheckRelationships(ctx context.Context, filter CheckFilter) (PathSeq, error) {
-	r.record("check", filter.ResourceType, strings.Join(filter.ResourceIDs, ","), filter.ResourceRelation,
+	r.record(func(c *ReaderCounts) { c.Checks++ }, "check", filter.ResourceType, strings.Join(filter.ResourceIDs, ","), filter.ResourceRelation,
 		filter.SubjectType, strings.Join(filter.SubjectIDs, ","), filter.SubjectRelation)
 	return r.inner.CheckRelationships(ctx, filter)
 }
 
-func (r *CountingReader) QuerySubjects(
-	ctx context.Context,
-	resource Object,
-	resourceRelation string,
-	subjectType ObjectType,
-	withCaveats, withExpiration bool,
-	page QueryPage,
-) (PathSeq, error) {
-	r.record("subjects", resource.ObjectType, resource.ObjectID, resourceRelation, subjectType.String())
-	return r.inner.QuerySubjects(ctx, resource, resourceRelation, subjectType, withCaveats, withExpiration, page)
+func (r *CountingReader) QuerySubjects(ctx context.Context, filter SubjectsFilter) (PathSeq, error) {
+	r.record(func(c *ReaderCounts) { c.Subjects++ }, "subjects", filter.ResourceType, strings.Join(filter.ResourceIDs, ","), filter.ResourceRelation,
+		filter.SubjectType, filter.SubjectRelation)
+	return r.inner.QuerySubjects(ctx, filter)
 }
 
-func (r *CountingReader) QueryResources(
-	ctx context.Context,
-	resourceType string,
-	resourceRelation string,
-	subject ObjectAndRelation,
-	withCaveats, withExpiration bool,
-	page QueryPage,
-) (PathSeq, error) {
-	r.record("resources", resourceType, resourceRelation, subject.String())
-	return r.inner.QueryResources(ctx, resourceType, resourceRelation, subject, withCaveats, withExpiration, page)
+func (r *CountingReader) QueryResources(ctx context.Context, filter ResourcesFilter) (PathSeq, error) {
+	r.record(func(c *ReaderCounts) { c.Resources++ }, "resources", filter.ResourceType, filter.ResourceRelation,
+		filter.SubjectType, strings.Join(filter.SubjectIDs, ","), filter.SubjectRelation)
+	return r.inner.QueryResources(ctx, filter)
 }
 
 func (r *CountingReader) SubjectExistsAsRelationship(
@@ -107,7 +122,7 @@ func (r *CountingReader) SubjectExistsAsRelationship(
 	subject Object,
 	nonEllipsisRelation string,
 ) (bool, error) {
-	r.record("exists", subject.ObjectType, subject.ObjectID, nonEllipsisRelation)
+	r.record(func(c *ReaderCounts) { c.ExistenceProbes++ }, "exists", subject.ObjectType, subject.ObjectID, nonEllipsisRelation)
 	return r.inner.SubjectExistsAsRelationship(ctx, subject, nonEllipsisRelation)
 }
 

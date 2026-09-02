@@ -8,6 +8,7 @@ import (
 
 	"github.com/authzed/spicedb/internal/caveats"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 	"github.com/authzed/spicedb/pkg/tuple"
 )
 
@@ -314,50 +315,70 @@ func (r *RecursiveIterator) breadthFirstIterSubjects(ctx *Context, resource Obje
 			// Clear the ply map and reuse its backing storage.
 			clear(plyPaths)
 
-			// Query IterSubjects FROM each frontier object, accumulating results in plyPaths.
+			// Query IterSubjects FROM the whole frontier at once, accumulating
+			// results in plyPaths. Batching is the point: the frontier is already
+			// a materialized slice, so a wide ply costs one datastore query rather
+			// than one per object. Each returned path names the frontier object it
+			// came from in Path.Resource, which is how it is matched back to its
+			// entry for caveat and expiration combination.
+			//
 			// Paths with the same endpoint from different frontier nodes are merged with OR.
-			for _, fe := range frontier {
-				frontierResource := GetObject(fe.Subject)
+			frontierResources := make([]Object, len(frontier))
+			entryByResource := make(map[Object]frontierEntry, len(frontier))
+			for i, fe := range frontier {
+				frontierResources[i] = GetObject(fe.Subject)
+				entryByResource[frontierResources[i]] = fe
+			}
 
-				if ctx.shouldTrace() {
-					ctx.TraceStep(r, "Ply %d: querying from %s:%s",
-						ply, frontierResource.ObjectType, frontierResource.ObjectID)
-				}
+			if ctx.shouldTrace() {
+				ctx.TraceStep(r, "Ply %d: querying from %d frontier objects", ply, len(frontierResources))
+			}
 
-				subSeq, err := ctx.IterSubjects(r.templateTree, frontierResource, NoObjectFilter())
+			subSeq, err := ctx.IterSubjectsForResources(r.templateTree, frontierResources, NoObjectFilter())
+			if err != nil {
+				yield(nil, fmt.Errorf("execution failed at ply %d: %w", ply, err))
+				return
+			}
+
+			for subPath, err := range subSeq {
 				if err != nil {
 					yield(nil, fmt.Errorf("execution failed at ply %d: %w", ply, err))
 					return
 				}
 
-				for subPath, err := range subSeq {
-					if err != nil {
-						yield(nil, fmt.Errorf("execution failed at ply %d: %w", ply, err))
+				fe, ok := entryByResource[subPath.Resource]
+				if !ok {
+					// A path whose resource is not in the frontier cannot be
+					// attributed to an entry, so its caveats cannot be combined
+					// correctly. Skipping it silently would drop results, so this
+					// is a bug in an iterator's resource propagation.
+					yield(nil, spiceerrors.MustBugf(
+						"recursive ply %d received a path for %s:%s, which is not in the frontier",
+						ply, subPath.Resource.ObjectType, subPath.Resource.ObjectID))
+					return
+				}
+
+				// Combine frontier entry with sub-path to get full path from original resource:
+				//   fe:      original_resource → frontier_resource  (implicit)
+				//   subPath: frontier_resource → subject
+				//   result:  original_resource → subject
+				combinedPath := &Path{
+					Resource:   resource,
+					Relation:   r.relationName,
+					Subject:    subPath.Subject,
+					Caveat:     caveats.And(fe.Caveat, subPath.Caveat),
+					Expiration: combineExpiration(fe.Expiration, subPath.Expiration),
+					Integrity:  combineIntegrity(fe.Integrity, subPath.Integrity),
+				}
+
+				key := combinedPath.EndpointsKey()
+				if existing, seen := plyPaths[key]; seen {
+					if _, err := existing.MergeOr(combinedPath); err != nil {
+						yield(nil, err)
 						return
 					}
-
-					// Combine frontier entry with sub-path to get full path from original resource:
-					//   fe:      original_resource → frontier_resource  (implicit)
-					//   subPath: frontier_resource → subject
-					//   result:  original_resource → subject
-					combinedPath := &Path{
-						Resource:   resource,
-						Relation:   r.relationName,
-						Subject:    subPath.Subject,
-						Caveat:     caveats.And(fe.Caveat, subPath.Caveat),
-						Expiration: combineExpiration(fe.Expiration, subPath.Expiration),
-						Integrity:  combineIntegrity(fe.Integrity, subPath.Integrity),
-					}
-
-					key := combinedPath.EndpointsKey()
-					if existing, seen := plyPaths[key]; seen {
-						if _, err := existing.MergeOr(combinedPath); err != nil {
-							yield(nil, err)
-							return
-						}
-					} else {
-						plyPaths[key] = combinedPath
-					}
+				} else {
+					plyPaths[key] = combinedPath
 				}
 			}
 

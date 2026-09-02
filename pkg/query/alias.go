@@ -266,6 +266,126 @@ func (a *AliasIterator) IterSubjectsImpl(ctx *Context, resource Object, filterSu
 	return a.maybePrependSelfEdge(resource, subSeq, shouldAddSelfEdge), nil
 }
 
+// IterSubjectsForResourcesImpl passes the batch of resources down so the
+// enumeration can be answered in one datastore query, then prepends each
+// resource's self edge as the scalar path does.
+//
+// The self-edge decision is still made per resource, because it rests on an
+// existence probe that has no batched form yet; the enumeration underneath is
+// what stops scaling here.
+func (a *AliasIterator) IterSubjectsForResourcesImpl(ctx *Context, resources []Object, filterSubjectType ObjectType) (PathSeq, error) {
+	subSeq, err := ctx.IterSubjectsForResources(a.subIt, resources, filterSubjectType)
+	if err != nil {
+		return nil, err
+	}
+
+	rel := a.effectiveRelation()
+	selfEdges := make([]*Path, 0, len(resources))
+	for _, resource := range resources {
+		if !a.shouldIncludeSelfEdge(ctx, resource, filterSubjectType) {
+			continue
+		}
+		selfEdges = append(selfEdges, &Path{
+			Resource: resource,
+			Relation: rel,
+			Subject: ObjectAndRelation{
+				ObjectType: resource.ObjectType,
+				ObjectID:   resource.ObjectID,
+				Relation:   rel,
+			},
+			Metadata: make(map[string]any),
+		})
+	}
+
+	return DeduplicatePathSeq(func(yield func(*Path, error) bool) {
+		for _, selfPath := range selfEdges {
+			if !yield(selfPath, nil) {
+				return
+			}
+		}
+		for path, err := range subSeq {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			path.Relation = rel
+			if !yield(path, nil) {
+				return
+			}
+		}
+	}), nil
+}
+
+// IterResourcesForSubjectsImpl passes the batch of subjects down, then relabels
+// each result and adds the self edge for the subjects that warrant one.
+func (a *AliasIterator) IterResourcesForSubjectsImpl(ctx *Context, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
+	subSeq, err := ctx.IterResourcesForSubjects(a.subIt, subjects, filterResourceType)
+	if err != nil {
+		return nil, err
+	}
+
+	rel := a.effectiveRelation()
+	resourceTypes, err := a.ResourceType()
+	if err != nil {
+		return nil, err
+	}
+
+	selfEdges := make([]*Path, 0, len(subjects))
+	for _, subject := range subjects {
+		if !a.matchesSelfEdgeRelation(subject.Relation) {
+			continue
+		}
+		if !typeAllowsSelfEdge(resourceTypes, subject.ObjectType) {
+			continue
+		}
+		resource := GetObject(subject)
+		selfEdges = append(selfEdges, &Path{
+			Resource: resource,
+			Relation: rel,
+			Subject: ObjectAndRelation{
+				ObjectType: resource.ObjectType,
+				ObjectID:   resource.ObjectID,
+				Relation:   rel,
+			},
+			Metadata: make(map[string]any),
+		})
+	}
+
+	return DeduplicatePathSeq(func(yield func(*Path, error) bool) {
+		for _, selfPath := range selfEdges {
+			if !yield(selfPath, nil) {
+				return
+			}
+		}
+		for path, err := range subSeq {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			path.Relation = rel
+			if !yield(path, nil) {
+				return
+			}
+		}
+	}), nil
+}
+
+// typeAllowsSelfEdge reports whether a self edge is permitted for a subject of
+// the given type: either the iterator is unconstrained, or the subject's type is
+// one of the resource types it can produce. This mirrors the check in
+// IterResourcesImpl.
+func typeAllowsSelfEdge(resourceTypes []ObjectType, subjectType string) bool {
+	if len(resourceTypes) == 0 {
+		return true
+	}
+	for _, rt := range resourceTypes {
+		if rt.Type == subjectType {
+			return true
+		}
+	}
+	return false
+}
+
 // shouldIncludeSelfEdge checks if a self-edge should be included for the given resource.
 // This matches the dispatcher's identity check behavior: if resource#relation appears as
 // a subject anywhere in the datastore (expired or not), and the filter allows it, we

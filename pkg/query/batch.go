@@ -63,3 +63,96 @@ func CheckManyResourcesOn(ctx *Context, it Iterator, resources []Object, subject
 	}
 	return out, nil
 }
+
+// BatchSubjectsWalker is implemented by iterators that can enumerate subjects
+// from several resources in fewer datastore round-trips than the equivalent loop
+// over IterSubjectsImpl.
+//
+// Like BatchIterator it is optional, asked for with a type assertion, with a
+// per-resource loop as the fallback. Unlike a batched check, the result is a
+// single stream rather than a parallel slice: callers attribute each path back
+// to its starting point through Path.Resource, which every iterator preserves.
+//
+// The two axes are separate interfaces on purpose. An iterator may be able to
+// batch one and not the other, and a single interface requiring both would
+// silently fall back to the per-element loop for an iterator that implemented
+// only the axis it can actually batch.
+type BatchSubjectsWalker interface {
+	// IterSubjectsForResourcesImpl enumerates the subjects of every resource in
+	// resources.
+	IterSubjectsForResourcesImpl(ctx *Context, resources []Object, filterSubjectType ObjectType) (PathSeq, error)
+}
+
+// BatchResourcesWalker is the subject-axis counterpart of BatchSubjectsWalker:
+// iterators that can enumerate resources from several subjects at once. Paths
+// are attributed back through Path.Subject.
+type BatchResourcesWalker interface {
+	// IterResourcesForSubjectsImpl enumerates the resources of every subject in
+	// subjects.
+	IterResourcesForSubjectsImpl(ctx *Context, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error)
+}
+
+// IterSubjectsForResourcesOn enumerates the subjects reachable from every
+// resource in resources, as one stream.
+//
+// As with CheckManySubjectsOn, this is the single place the batch-or-loop
+// decision is made: a BatchWalkIterator receives the whole slice, anything else
+// is walked one resource at a time.
+func IterSubjectsForResourcesOn(ctx *Context, it Iterator, resources []Object, filterSubjectType ObjectType) (PathSeq, error) {
+	if batch, ok := it.(BatchSubjectsWalker); ok {
+		return batch.IterSubjectsForResourcesImpl(ctx, resources, filterSubjectType)
+	}
+
+	return iterSubjectsPerResource(ctx, it, resources, filterSubjectType)
+}
+
+// iterSubjectsPerResource is the unbatched walk: one IterSubjectsImpl call per
+// resource, concatenated. It backs the fallback in IterSubjectsForResourcesOn
+// and is also used by batch-capable iterators for the cases they cannot batch,
+// such as a paginated query whose cursor cannot be shared across resources.
+func iterSubjectsPerResource(ctx *Context, it Iterator, resources []Object, filterSubjectType ObjectType) (PathSeq, error) {
+	return func(yield func(*Path, error) bool) {
+		for _, resource := range resources {
+			pathSeq, err := it.IterSubjectsImpl(ctx, resource, filterSubjectType)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			for path, err := range FilterSubjectsByType(pathSeq, filterSubjectType) {
+				if !yield(path, err) {
+					return
+				}
+			}
+		}
+	}, nil
+}
+
+// IterResourcesForSubjectsOn enumerates the resources reachable from every
+// subject in subjects, as one stream. It is the subject-axis counterpart of
+// IterSubjectsForResourcesOn.
+func IterResourcesForSubjectsOn(ctx *Context, it Iterator, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
+	if batch, ok := it.(BatchResourcesWalker); ok {
+		return batch.IterResourcesForSubjectsImpl(ctx, subjects, filterResourceType)
+	}
+
+	return iterResourcesPerSubject(ctx, it, subjects, filterResourceType)
+}
+
+// iterResourcesPerSubject is the unbatched walk, the subject-axis counterpart of
+// iterSubjectsPerResource.
+func iterResourcesPerSubject(ctx *Context, it Iterator, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
+	return func(yield func(*Path, error) bool) {
+		for _, subject := range subjects {
+			pathSeq, err := it.IterResourcesImpl(ctx, subject, filterResourceType)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			for path, err := range FilterResourcesByType(pathSeq, filterResourceType) {
+				if !yield(path, err) {
+					return
+				}
+			}
+		}
+	}, nil
+}

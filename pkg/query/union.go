@@ -168,6 +168,61 @@ func (u *UnionIterator) IterResourcesImpl(ctx *Context, subject ObjectAndRelatio
 	return DeduplicatePathSeq(combinedSeq), nil
 }
 
+// IterSubjectsForResourcesImpl passes the batch of resources to every branch, so
+// a wide frontier costs each branch one query instead of one per resource.
+//
+// A union is safe to batch because its result is a plain concatenation: no
+// branch's contribution depends on what another branch produced for the same
+// resource. Set operations do not have that property — an intersection or
+// exclusion has to be evaluated per resource — which is why they keep the
+// per-resource fallback instead of implementing BatchWalkIterator.
+//
+// Deduplication keys on Path.EndpointsKey, which includes the resource, so
+// paths from different resources in the batch cannot collapse into each other.
+func (u *UnionIterator) IterSubjectsForResourcesImpl(ctx *Context, resources []Object, filterSubjectType ObjectType) (PathSeq, error) {
+	if ctx.shouldTrace() {
+		ctx.TraceStep(u, "batched subjects across %d sub-iterators for %d resources", len(u.subIts), len(resources))
+	}
+
+	return DeduplicatePathSeq(func(yield func(*Path, error) bool) {
+		for _, it := range u.subIts {
+			pathSeq, err := ctx.IterSubjectsForResources(it, resources, filterSubjectType)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			for path, err := range pathSeq {
+				if !yield(path, err) {
+					return
+				}
+			}
+		}
+	}), nil
+}
+
+// IterResourcesForSubjectsImpl is the subject-axis counterpart of
+// IterSubjectsForResourcesImpl.
+func (u *UnionIterator) IterResourcesForSubjectsImpl(ctx *Context, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
+	if ctx.shouldTrace() {
+		ctx.TraceStep(u, "batched resources across %d sub-iterators for %d subjects", len(u.subIts), len(subjects))
+	}
+
+	return DeduplicatePathSeq(func(yield func(*Path, error) bool) {
+		for _, it := range u.subIts {
+			pathSeq, err := ctx.IterResourcesForSubjects(it, subjects, filterResourceType)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			for path, err := range pathSeq {
+				if !yield(path, err) {
+					return
+				}
+			}
+		}
+	}), nil
+}
+
 func (u *UnionIterator) Clone() Iterator {
 	cloned := &UnionIterator{
 		canonicalKey: u.canonicalKey,

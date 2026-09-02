@@ -41,3 +41,15 @@ func (l LocalExecutor) IterResources(ctx *Context, it Iterator, subject ObjectAn
 	// Apply filtering wrapper - this is where the actual filtering happens
 	return FilterResourcesByType(pathSeq, filterResourceType), nil
 }
+
+// IterSubjectsForResources returns one sequence covering the subjects of every
+// resource in resources.
+func (l LocalExecutor) IterSubjectsForResources(ctx *Context, it Iterator, resources []Object, filterSubjectType ObjectType) (PathSeq, error) {
+	return IterSubjectsForResourcesOn(ctx, it, resources, filterSubjectType)
+}
+
+// IterResourcesForSubjects returns one sequence covering the resources of every
+// subject in subjects.
+func (l LocalExecutor) IterResourcesForSubjects(ctx *Context, it Iterator, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
+	return IterResourcesForSubjectsOn(ctx, it, subjects, filterResourceType)
+}

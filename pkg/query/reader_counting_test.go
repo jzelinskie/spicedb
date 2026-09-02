@@ -24,12 +24,12 @@ func (s *stubReader) CheckRelationships(_ context.Context, _ CheckFilter) (PathS
 	return EmptyPathSeq(), nil
 }
 
-func (s *stubReader) QuerySubjects(_ context.Context, _ Object, _ string, _ ObjectType, _, _ bool, _ QueryPage) (PathSeq, error) {
+func (s *stubReader) QuerySubjects(_ context.Context, _ SubjectsFilter) (PathSeq, error) {
 	s.calls.Add(1)
 	return EmptyPathSeq(), nil
 }
 
-func (s *stubReader) QueryResources(_ context.Context, _ string, _ string, _ ObjectAndRelation, _, _ bool, _ QueryPage) (PathSeq, error) {
+func (s *stubReader) QueryResources(_ context.Context, _ ResourcesFilter) (PathSeq, error) {
 	s.calls.Add(1)
 	return EmptyPathSeq(), nil
 }
@@ -45,10 +45,26 @@ func (s *stubReader) LookupCaveatDefinition(_ context.Context, _ string) (datast
 }
 
 func TestCountingReader(t *testing.T) {
-	docType := ObjectType{Type: "document", Subrelation: "..."}
 	doc1 := NewObject("document", "doc1")
-	doc2 := NewObject("document", "doc2")
-	alice := NewObject("user", "alice").WithEllipses()
+
+	subjectsOf := func(resourceID string) SubjectsFilter {
+		return SubjectsFilter{
+			ResourceType:     "document",
+			ResourceIDs:      []string{resourceID},
+			ResourceRelation: "viewer",
+			SubjectType:      "user",
+			SubjectRelation:  tuple.Ellipsis,
+		}
+	}
+	resourcesOf := func(subjectID string) ResourcesFilter {
+		return ResourcesFilter{
+			ResourceType:     "document",
+			ResourceRelation: "viewer",
+			SubjectType:      "user",
+			SubjectIDs:       []string{subjectID},
+			SubjectRelation:  tuple.Ellipsis,
+		}
+	}
 
 	checkDoc := func(id string) CheckFilter {
 		return CheckFilter{
@@ -69,9 +85,9 @@ func TestCountingReader(t *testing.T) {
 
 		_, err := r.CheckRelationships(ctx, checkDoc("doc1"))
 		require.NoError(err)
-		_, err = r.QuerySubjects(ctx, doc1, "viewer", docType, false, false, QueryPage{})
+		_, err = r.QuerySubjects(ctx, subjectsOf("doc1"))
 		require.NoError(err)
-		_, err = r.QueryResources(ctx, "document", "viewer", alice, false, false, QueryPage{})
+		_, err = r.QueryResources(ctx, resourcesOf("alice"))
 		require.NoError(err)
 		_, err = r.SubjectExistsAsRelationship(ctx, doc1, "viewer")
 		require.NoError(err)
@@ -107,9 +123,9 @@ func TestCountingReader(t *testing.T) {
 		// a distinct datastore query and must not collide in the key space.
 		_, err := r.CheckRelationships(ctx, checkDoc("doc1"))
 		require.NoError(err)
-		_, err = r.QuerySubjects(ctx, doc1, "viewer", docType, false, false, QueryPage{})
+		_, err = r.QuerySubjects(ctx, subjectsOf("doc1"))
 		require.NoError(err)
-		_, err = r.QueryResources(ctx, "document", "viewer", alice, false, false, QueryPage{})
+		_, err = r.QueryResources(ctx, resourcesOf("alice"))
 		require.NoError(err)
 
 		require.Equal(3, r.Queries())
@@ -160,7 +176,7 @@ func TestCountingReader(t *testing.T) {
 		for range goroutines {
 			wg.Go(func() {
 				for range perGoroutine {
-					_, _ = r.QuerySubjects(ctx, doc2, "viewer", docType, false, false, QueryPage{})
+					_, _ = r.QuerySubjects(ctx, subjectsOf("doc2"))
 				}
 			})
 		}

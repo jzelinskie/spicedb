@@ -37,32 +37,18 @@ func (r *delayReader) CheckRelationships(ctx context.Context, filter CheckFilter
 	return r.inner.CheckRelationships(ctx, filter)
 }
 
-func (r *delayReader) QuerySubjects(
-	ctx context.Context,
-	resource Object,
-	resourceRelation string,
-	subjectType ObjectType,
-	withCaveats, withExpiration bool,
-	page QueryPage,
-) (PathSeq, error) {
+func (r *delayReader) QuerySubjects(ctx context.Context, filter SubjectsFilter) (PathSeq, error) {
 	if err := r.sleep(ctx); err != nil {
 		return nil, err
 	}
-	return r.inner.QuerySubjects(ctx, resource, resourceRelation, subjectType, withCaveats, withExpiration, page)
+	return r.inner.QuerySubjects(ctx, filter)
 }
 
-func (r *delayReader) QueryResources(
-	ctx context.Context,
-	resourceType string,
-	resourceRelation string,
-	subject ObjectAndRelation,
-	withCaveats, withExpiration bool,
-	page QueryPage,
-) (PathSeq, error) {
+func (r *delayReader) QueryResources(ctx context.Context, filter ResourcesFilter) (PathSeq, error) {
 	if err := r.sleep(ctx); err != nil {
 		return nil, err
 	}
-	return r.inner.QueryResources(ctx, resourceType, resourceRelation, subject, withCaveats, withExpiration, page)
+	return r.inner.QueryResources(ctx, filter)
 }
 
 func (r *delayReader) SubjectExistsAsRelationship(

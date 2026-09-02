@@ -334,6 +334,52 @@ func (ctx *Context) CheckManyResources(it Iterator, resources []Object, subject 
 	return paths, nil
 }
 
+// IterSubjectsForResources enumerates the subjects of every resource in
+// resources, as a single sequence. Paths stay attributed to their originating
+// resource through Path.Resource.
+func (ctx *Context) IterSubjectsForResources(it Iterator, resources []Object, filterSubjectType ObjectType) (PathSeq, error) {
+	if ctx.Executor == nil {
+		return nil, spiceerrors.MustBugf("no executor has been set")
+	}
+	if len(resources) == 0 {
+		return EmptyPathSeq(), nil
+	}
+
+	ctx.MarkAsOperation(it, OperationIterSubjects)
+
+	key := it.CanonicalKey()
+	ctx.notifyEnterIterator(OperationIterSubjects, key)
+
+	pathSeq, err := ctx.Executor.IterSubjectsForResources(ctx, it, resources, filterSubjectType)
+	if err != nil {
+		return nil, err
+	}
+	return ctx.wrapPathSeqWithObservers(OperationIterSubjects, key, pathSeq), nil
+}
+
+// IterResourcesForSubjects enumerates the resources of every subject in
+// subjects, as a single sequence. Paths stay attributed to their originating
+// subject through Path.Subject.
+func (ctx *Context) IterResourcesForSubjects(it Iterator, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
+	if ctx.Executor == nil {
+		return nil, spiceerrors.MustBugf("no executor has been set")
+	}
+	if len(subjects) == 0 {
+		return EmptyPathSeq(), nil
+	}
+
+	ctx.MarkAsOperation(it, OperationIterResources)
+
+	key := it.CanonicalKey()
+	ctx.notifyEnterIterator(OperationIterResources, key)
+
+	pathSeq, err := ctx.Executor.IterResourcesForSubjects(ctx, it, subjects, filterResourceType)
+	if err != nil {
+		return nil, err
+	}
+	return ctx.wrapPathSeqWithObservers(OperationIterResources, key, pathSeq), nil
+}
+
 // wrapPathSeqForTracing wraps a PathSeq to collect results for exit tracing if tracing is enabled,
 // otherwise returns the original PathSeq unchanged.
 func (ctx *Context) wrapPathSeqForTracing(it Iterator, pathSeq PathSeq) PathSeq {
@@ -452,6 +498,16 @@ type Executor interface {
 	// The filterSubjectType parameter filters results to only include subjects matching the
 	// specified ObjectType. If filterSubjectType.Type is empty, no filtering is applied.
 	IterSubjects(ctx *Context, it Iterator, resource Object, filterSubjectType ObjectType) (PathSeq, error)
+
+	// IterSubjectsForResources returns one sequence covering the subjects of
+	// every resource in resources. Each path carries the resource it came from
+	// in Path.Resource.
+	IterSubjectsForResources(ctx *Context, it Iterator, resources []Object, filterSubjectType ObjectType) (PathSeq, error)
+
+	// IterResourcesForSubjects returns one sequence covering the resources of
+	// every subject in subjects. Each path carries the subject it came from in
+	// Path.Subject.
+	IterResourcesForSubjects(ctx *Context, it Iterator, subjects []ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error)
 
 	// IterResources returns a sequence of all the relations in this set that match the given subject.
 	// The filterResourceType parameter filters results to only include resources matching the

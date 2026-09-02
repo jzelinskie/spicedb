@@ -36,7 +36,41 @@ type CheckFilter struct {
 	WithExpiration   bool
 }
 
-// QueryPage bundles pagination parameters for QuerySubjects and QueryResources.
+// SubjectsFilter selects the relationships needed to enumerate subjects: every
+// subject of the given type and relation reachable from any of ResourceIDs.
+//
+// ResourceIDs is plural so that enumerating from several resources at once —
+// a recursion ply, or an arrow draining its left side — costs one query rather
+// than one per resource. An empty ResourceIDs applies no resource ID
+// constraint, which is how wildcard expansion asks for every resource of the
+// type. SubjectRelation drives the ellipsis-vs-non-ellipsis filter.
+type SubjectsFilter struct {
+	ResourceType     string
+	ResourceIDs      []string
+	ResourceRelation string
+	SubjectType      string
+	SubjectRelation  string
+	WithCaveats      bool
+	WithExpiration   bool
+	Page             QueryPage
+}
+
+// ResourcesFilter selects the relationships needed to enumerate resources:
+// every resource of the given type and relation reachable from any of
+// SubjectIDs. It is the subject-axis counterpart of SubjectsFilter; SubjectIDs
+// may contain WildcardObjectID for wildcard resource queries.
+type ResourcesFilter struct {
+	ResourceType     string
+	ResourceRelation string
+	SubjectType      string
+	SubjectIDs       []string
+	SubjectRelation  string
+	WithCaveats      bool
+	WithExpiration   bool
+	Page             QueryPage
+}
+
+// QueryPage bundles pagination parameters for SubjectsFilter and ResourcesFilter.
 type QueryPage struct {
 	Limit  *uint64
 	Cursor *tuple.Relationship
@@ -51,28 +85,11 @@ type QueryDatastoreReader interface {
 	// datastore as a single query; a scalar check passes single-element slices.
 	CheckRelationships(ctx context.Context, filter CheckFilter) (PathSeq, error)
 
-	// QuerySubjects finds all subject paths for a resource.
-	// If resource.ObjectID is empty, no resource ID filter is applied (wildcard expansion).
-	// subjectType.Subrelation drives the ellipsis-vs-non-ellipsis filter.
-	QuerySubjects(
-		ctx context.Context,
-		resource Object,
-		resourceRelation string,
-		subjectType ObjectType,
-		withCaveats, withExpiration bool,
-		page QueryPage,
-	) (PathSeq, error)
+	// QuerySubjects finds all subject paths for the filter's resources.
+	QuerySubjects(ctx context.Context, filter SubjectsFilter) (PathSeq, error)
 
-	// QueryResources finds all resource paths for a subject.
-	// subject.ObjectID may be WildcardObjectID for wildcard resource queries.
-	QueryResources(
-		ctx context.Context,
-		resourceType string,
-		resourceRelation string,
-		subject ObjectAndRelation,
-		withCaveats, withExpiration bool,
-		page QueryPage,
-	) (PathSeq, error)
+	// QueryResources finds all resource paths for the filter's subjects.
+	QueryResources(ctx context.Context, filter ResourcesFilter) (PathSeq, error)
 
 	// SubjectExistsAsRelationship is an existence probe used by AliasIterator.
 	// It includes expired relationships and returns true if any relationship
@@ -152,31 +169,24 @@ func (r *datalayerQueryDatastoreReader) CheckRelationships(ctx context.Context, 
 	return convertRelationSeqToPathSeq(iter.Seq2[tuple.Relationship, error](relIter)), nil
 }
 
-func (r *datalayerQueryDatastoreReader) QuerySubjects(
-	ctx context.Context,
-	resource Object,
-	resourceRelation string,
-	subjectType ObjectType,
-	withCaveats, withExpiration bool,
-	page QueryPage,
-) (PathSeq, error) {
+func (r *datalayerQueryDatastoreReader) QuerySubjects(ctx context.Context, subjects SubjectsFilter) (PathSeq, error) {
 	filter := datastore.RelationshipsFilter{
 		OptionalSubjectsSelectors: []datastore.SubjectsSelector{
 			{
-				OptionalSubjectType: subjectType.Type,
-				RelationFilter:      buildSubjectRelationFilter(subjectType.Subrelation),
+				OptionalSubjectType: subjects.SubjectType,
+				RelationFilter:      buildSubjectRelationFilter(subjects.SubjectRelation),
 			},
 		},
 	}
 	// Non-empty fields constrain the query; empty means no constraint on that axis.
-	if resource.ObjectType != "" {
-		filter.OptionalResourceType = resource.ObjectType
+	if subjects.ResourceType != "" {
+		filter.OptionalResourceType = subjects.ResourceType
 	}
-	if resource.ObjectID != "" {
-		filter.OptionalResourceIds = []string{resource.ObjectID}
+	if len(subjects.ResourceIDs) > 0 {
+		filter.OptionalResourceIds = subjects.ResourceIDs
 	}
-	if resourceRelation != "" {
-		filter.OptionalResourceRelation = resourceRelation
+	if subjects.ResourceRelation != "" {
+		filter.OptionalResourceRelation = subjects.ResourceRelation
 	}
 
 	// Choose the query shape based on whether subject filters are present.
@@ -187,22 +197,22 @@ func (r *datalayerQueryDatastoreReader) QuerySubjects(
 	// When there are no subject filters, AllSubjectsForResources is correct and matches
 	// the traditional dispatch path.
 	shape := queryshape.AllSubjectsForResources
-	if subjectType.Type != "" {
+	if subjects.SubjectType != "" {
 		shape = queryshape.Varying
 	}
 	queryOpts := []options.QueryOptionsOption{
-		options.WithSkipCaveats(!withCaveats),
-		options.WithSkipExpiration(!withExpiration),
+		options.WithSkipCaveats(!subjects.WithCaveats),
+		options.WithSkipExpiration(!subjects.WithExpiration),
 		options.WithQueryShape(shape),
 	}
-	if page.Limit != nil {
+	if subjects.Page.Limit != nil {
 		queryOpts = append(queryOpts,
-			options.WithLimit(page.Limit),
+			options.WithLimit(subjects.Page.Limit),
 			options.WithSort(options.ChooseEfficient),
 		)
 	}
-	if page.Cursor != nil {
-		queryOpts = append(queryOpts, options.WithAfter(options.ToCursor(*page.Cursor)))
+	if subjects.Page.Cursor != nil {
+		queryOpts = append(queryOpts, options.WithAfter(options.ToCursor(*subjects.Page.Cursor)))
 	}
 
 	relIter, err := r.inner.QueryRelationships(ctx, filter, queryOpts...)
@@ -212,39 +222,32 @@ func (r *datalayerQueryDatastoreReader) QuerySubjects(
 	return convertRelationSeqToPathSeq(iter.Seq2[tuple.Relationship, error](relIter)), nil
 }
 
-func (r *datalayerQueryDatastoreReader) QueryResources(
-	ctx context.Context,
-	resourceType string,
-	resourceRelation string,
-	subject ObjectAndRelation,
-	withCaveats, withExpiration bool,
-	page QueryPage,
-) (PathSeq, error) {
+func (r *datalayerQueryDatastoreReader) QueryResources(ctx context.Context, resources ResourcesFilter) (PathSeq, error) {
 	filter := datastore.RelationshipsFilter{
-		OptionalResourceType:     resourceType,
-		OptionalResourceRelation: resourceRelation,
+		OptionalResourceType:     resources.ResourceType,
+		OptionalResourceRelation: resources.ResourceRelation,
 		OptionalSubjectsSelectors: []datastore.SubjectsSelector{
 			{
-				OptionalSubjectType: subject.ObjectType,
-				OptionalSubjectIds:  []string{subject.ObjectID},
-				RelationFilter:      buildSubjectRelationFilter(subject.Relation),
+				OptionalSubjectType: resources.SubjectType,
+				OptionalSubjectIds:  resources.SubjectIDs,
+				RelationFilter:      buildSubjectRelationFilter(resources.SubjectRelation),
 			},
 		},
 	}
 
 	queryOpts := []options.QueryOptionsOption{
-		options.WithSkipCaveats(!withCaveats),
-		options.WithSkipExpiration(!withExpiration),
+		options.WithSkipCaveats(!resources.WithCaveats),
+		options.WithSkipExpiration(!resources.WithExpiration),
 		options.WithQueryShape(queryshape.MatchingResourcesForSubject),
 	}
-	if page.Limit != nil {
+	if resources.Page.Limit != nil {
 		queryOpts = append(queryOpts,
-			options.WithLimit(page.Limit),
+			options.WithLimit(resources.Page.Limit),
 			options.WithSort(options.ChooseEfficient),
 		)
 	}
-	if page.Cursor != nil {
-		queryOpts = append(queryOpts, options.WithAfter(options.ToCursor(*page.Cursor)))
+	if resources.Page.Cursor != nil {
+		queryOpts = append(queryOpts, options.WithAfter(options.ToCursor(*resources.Page.Cursor)))
 	}
 
 	relIter, err := r.inner.QueryRelationships(ctx, filter, queryOpts...)

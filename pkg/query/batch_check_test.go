@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -109,4 +110,98 @@ func TestCheckManyResourcesIssuesOneQuery(t *testing.T) {
 
 	require.Equal(1, reader.Queries(),
 		"three resources against one subject must collapse into a single datastore query")
+}
+
+// documentsWithViewers builds N documents, each with one distinct viewer.
+func documentsWithViewers(n int) ([]tuple.Relationship, []Object, []ObjectAndRelation) {
+	rels := make([]tuple.Relationship, 0, n)
+	resources := make([]Object, 0, n)
+	subjects := make([]ObjectAndRelation, 0, n)
+	for i := range n {
+		rels = append(rels, tuple.MustParse(fmt.Sprintf("document:doc%d#viewer@user:user%d", i, i)))
+		resources = append(resources, NewObject("document", fmt.Sprintf("doc%d", i)))
+		subjects = append(subjects, NewObject("user", fmt.Sprintf("user%d", i)).WithEllipses())
+	}
+	return rels, resources, subjects
+}
+
+// TestIterSubjectsForResourcesDoesNotScaleWithResourceCount is the round-trip
+// invariant for the iteration axis: enumerating subjects for many resources
+// must cost the same number of enumeration queries as enumerating for one.
+//
+// The assertion is on ReaderCounts.Subjects rather than the total because the
+// alias self-edge probe is a separate, still-unbatched query — one existence
+// probe per resource per alias level. That is asserted explicitly below so the
+// remaining gap is recorded rather than hidden; when the probe is batched or
+// decided statically from the schema, this test should tighten to the total.
+func TestIterSubjectsForResourcesDoesNotScaleWithResourceCount(t *testing.T) {
+	require := require.New(t)
+
+	countsFor := func(count int) (ReaderCounts, []*Path) {
+		rels, resources, _ := documentsWithViewers(count)
+		it, reader, opts := newBatchCheckFixture(t, rels)
+
+		pathSeq, err := NewLocalContext(t.Context(), opts...).
+			IterSubjectsForResources(it, resources, NoObjectFilter())
+		require.NoError(err)
+		paths, err := CollectAll(pathSeq)
+		require.NoError(err)
+		return reader.Counts(), paths
+	}
+
+	one, _ := countsFor(1)
+	many, paths := countsFor(8)
+
+	require.Equal(1, one.Subjects, "one resource takes one enumeration query")
+	require.Equal(one.Subjects, many.Subjects,
+		"a batch of 8 resources must take the same number of enumeration queries as a batch of 1")
+
+	// Not yet batched: the alias self-edge probe is still one query per resource
+	// per alias level. Recorded so a change in either direction is visible.
+	require.Equal(8*one.ExistenceProbes, many.ExistenceProbes,
+		"self-edge probes still scale with the batch; see AliasIterator.shouldIncludeSelfEdge")
+
+	subjectsByResource := map[string]string{}
+	for _, path := range paths {
+		subjectsByResource[path.Resource.ObjectID] = path.Subject.ObjectID
+	}
+	require.Len(subjectsByResource, 8, "every resource must be represented")
+	for i := range 8 {
+		require.Equal(fmt.Sprintf("user%d", i), subjectsByResource[fmt.Sprintf("doc%d", i)],
+			"paths must stay attributed to the resource they came from")
+	}
+}
+
+// TestIterResourcesForSubjectsDoesNotScaleWithSubjectCount is the subject-axis
+// counterpart.
+func TestIterResourcesForSubjectsDoesNotScaleWithSubjectCount(t *testing.T) {
+	require := require.New(t)
+
+	queriesFor := func(count int) (int, []*Path) {
+		rels, _, subjects := documentsWithViewers(count)
+		it, reader, opts := newBatchCheckFixture(t, rels)
+
+		pathSeq, err := NewLocalContext(t.Context(), opts...).
+			IterResourcesForSubjects(it, subjects, NoObjectFilter())
+		require.NoError(err)
+		paths, err := CollectAll(pathSeq)
+		require.NoError(err)
+		return reader.Queries(), paths
+	}
+
+	oneSubject, _ := queriesFor(1)
+	manySubjects, paths := queriesFor(8)
+
+	require.Equal(oneSubject, manySubjects,
+		"a batch of 8 subjects must cost the same as a batch of 1")
+
+	resourcesBySubject := map[string]string{}
+	for _, path := range paths {
+		resourcesBySubject[path.Subject.ObjectID] = path.Resource.ObjectID
+	}
+	require.Len(resourcesBySubject, 8, "every subject must be represented")
+	for i := range 8 {
+		require.Equal(fmt.Sprintf("doc%d", i), resourcesBySubject[fmt.Sprintf("user%d", i)],
+			"paths must stay attributed to the subject they came from")
+	}
 }

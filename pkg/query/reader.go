@@ -270,9 +270,14 @@ func (r *datalayerQueryDatastoreReader) SubjectExistsAsRelationship(
 		OptionalExpirationOption: datastore.ExpirationFilterOptionNone,
 	}
 
+	// The filter constrains subject type, subject ID and subject relation with
+	// no resource constraint at all, which matches none of the specific query
+	// shapes; Varying lets the datastore pick an index from the columns actually
+	// filtered rather than forcing one that does not fit.
 	relIter, err := r.inner.QueryRelationships(ctx, filter,
 		options.WithLimit(&limitOne),
 		options.WithSkipExpiration(true),
+		options.WithQueryShape(queryshape.Varying),
 	)
 	if err != nil {
 		return false, err

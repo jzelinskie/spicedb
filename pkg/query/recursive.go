@@ -258,6 +258,34 @@ func (r *RecursiveIterator) SubjectTypes() ([]ObjectType, error) {
 // breadthFirstIterSubjects implements BFS traversal for IterSubjects operations.
 // Uses context-based frontier collection: the sentinel collects queried resources during execution,
 // which are then used to build the frontier for the next ply.
+//
+// TODO: support several roots per expansion, so an enclosing arrow can hand the
+// whole set of intermediates to one BFS instead of one expansion per
+// intermediate. Today `document:doc1#viewer@group:g0..gN#member` costs N
+// expansions, each starting from a one-object frontier, and no amount of
+// batching inside a ply helps because the width was already spent upstream.
+//
+// This is not a mechanical change; two invariants here are single-root and would
+// become wrong if a roots slice were simply threaded through:
+//
+//  1. Path attribution. Every emitted path is labeled `Resource: resource` — the
+//     single root. With several roots, each frontier entry has to carry the root
+//     it descends from, and combinedPath must use that root instead. Getting
+//     this wrong does not fail loudly: paths come back attributed to an
+//     arbitrary root, and the enclosing arrow then joins them against the wrong
+//     left paths, inventing permissions that do not exist.
+//
+//  2. Cycle detection. queriedObjects is keyed by object alone and is shared for
+//     the whole traversal, which is what stops a cycle from looping forever.
+//     Across roots that key is too coarse: if group:g is reachable from root A
+//     and from root B, whichever root reaches it first claims it and the other
+//     root silently loses every path underneath it. The key has to become
+//     (root, object) — which also means the cycle-detection state, and therefore
+//     the memory held, grows with the number of roots, so a bound is needed
+//     before accepting an arbitrarily wide root set.
+//
+// yieldedPaths and plyPaths are already keyed by Path.EndpointsKey, which
+// includes the resource, so those two need no change once (1) is right.
 func (r *RecursiveIterator) breadthFirstIterSubjects(ctx *Context, resource Object, filterSubjectType ObjectType) (PathSeq, error) {
 	if ctx.shouldTrace() {
 		ctx.TraceStep(r, "BFS IterSubjects: resource=%s:%s, filter=%s",
@@ -280,6 +308,8 @@ func (r *RecursiveIterator) breadthFirstIterSubjects(ctx *Context, resource Obje
 		yieldedPaths := make(map[string]*Path)
 
 		// Track queried objects to prevent cycles (avoid re-querying same objects).
+		// Single-root: see the TODO on this method for why this key must become
+		// (root, object) before the traversal can start from several roots.
 		queriedObjects := make(map[string]bool)
 
 		// frontier holds lightweight entries — just the fields needed to combine with the next
